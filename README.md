@@ -2,7 +2,7 @@
 
 <img src="assets/title.png" alt="Mine Cart Carnage" width="520">
 
-### An endless mine-cart runner — pixel-art tribute to the SNES classic.
+### An endless mine-cart runner. Pixel-art tribute to the SNES classic.
 
 [![Play Now](https://img.shields.io/badge/▶_PLAY_NOW-kabronero.github.io-FFD060?style=for-the-badge&labelColor=3a1808)](https://kabronero.github.io/mine-cart-carnage/)
 
@@ -32,14 +32,14 @@ runs. Mobile-first but feels great on desktop too.
 - 🎢 **Procedural mine-cart track** with 6 segment types: flat, slopes,
   gaps, stacked twin rails, valleys, oncoming carts
 - 🍌 **Bananas + mega-bananas** with fly-to-counter pickup animation
-- 🎯 **Combo system** — score multiplier that grows with banana streaks,
+- 🎯 **Combo system**: score multiplier that grows with banana streaks,
   with milestone celebrations at every x10
-- 🦘 **Analog jump** — hold longer = jump higher (variable gravity)
+- 🦘 **Analog jump**: hold longer = jump higher (variable gravity)
 - 🐊 **Kremling-style enemies** that ride toward you on parallel rails
 - 💥 **TNT barrel explosions** with hand-painted boom sprite
 - 🎵 **Synthesized chiptune** soundtrack (Web Audio, no samples) that
   layers in extra parts as your combo climbs
-- 📱 **Real portrait mode** — the canvas resizes and the layout adapts,
+- 📱 **Real portrait mode**: the canvas resizes and the layout adapts,
   not just letterboxed landscape
 - 🎨 **AI-generated 16-bit pixel art** sprites with proper alpha-keyed
   PNGs (Vision framework + magenta chroma-key pipeline)
@@ -52,12 +52,12 @@ runs. Mobile-first but feels great on desktop too.
 |---|---|---|
 | Jump | `Space` / `↑` / `W` | Tap and hold the screen |
 | Higher jump | Hold the key longer | Hold the screen longer |
-| Toggle music | `M` | — |
+| Toggle music | `M` | n/a |
 
 ## Tech
 
 - **HTML5 Canvas** for everything
-- **Vanilla JavaScript** — no framework, no build step
+- **Vanilla JavaScript**, no framework, no build step
 - **Web Audio API** for synthesized chiptune music + SFX
 - **localStorage** for high-score persistence
 - **Sprite pipeline** (in [`scripts/`](scripts/)):
@@ -92,7 +92,7 @@ mine-cart-carnage/
 ## Credits & disclaimer
 
 Inspired by *Donkey Kong Country* (Rare / Nintendo, 1994). All sprites and
-audio in this project are original — generated or synthesized — and the
+audio in this project are original (generated or synthesized) and the
 character design intentionally avoids reproducing Nintendo's IP. This is a
 fan-made tribute, not affiliated with or endorsed by Rare or Nintendo.
 
@@ -100,4 +100,4 @@ Built collaboratively with [Claude Code](https://claude.com/claude-code).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
