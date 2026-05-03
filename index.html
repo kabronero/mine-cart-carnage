@@ -1884,13 +1884,17 @@ function drawTrack(){
 }
 
 // --- BANANAS ---
+// In-world bananas are rotated to a near-vertical pose (DKC style) instead
+// of the sprite's natural horizontal lay. The HUD banana keeps its own rot.
+const BANANA_BASE_ROT = -Math.PI / 2.6;   // ~70° CCW, close to upright
+
 function drawBananas(){
     for (const b of bananas){
-        if (b.taken) continue;  // taken bananas now fly to the HUD instead
+        if (b.taken) continue;  // taken bananas fly to the HUD instead
         const sx = b.x - worldX;
         if (sx < -40 || sx > W + 40) continue;
         const bob = Math.sin(b.anim) * 4;
-        const rot = Math.sin(b.anim * 0.7) * 0.2;
+        const rot = BANANA_BASE_ROT + Math.sin(b.anim * 0.7) * 0.18;
         if (b.mega){
             drawMegaBanana(sx, b.y + bob, rot);
         } else {
