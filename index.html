@@ -231,38 +231,56 @@ let sfxEnabled = true;
 let hapticsEnabled = true;
 let hapticSwitch = null;
 
+// Create a hidden iOS-style switch checkbox wrapped in a label. The label
+// is what we click — that toggles the contained input, and iOS fires native
+// haptic feedback on every toggle of a `<input type="checkbox" switch>`.
+// Critical details (cribbed from haptics.lochie.me):
+//   - Label CONTAINS the input, and we click the LABEL, not the input
+//   - Input keeps `all:initial; appearance:auto` so iOS applies switch style
+//   - Element stays in the render tree (off-screen, NOT display:none)
+//   - No pointer-events:none — that can break programmatic dispatch
 function ensureHapticSwitch(){
-    if (hapticSwitch || typeof document === 'undefined') return;
-    const el = document.createElement('input');
-    el.type = 'checkbox';
-    el.setAttribute('switch', '');           // iOS-native switch appearance
-    el.setAttribute('aria-hidden', 'true');
-    el.tabIndex = -1;
-    // Hide off-screen but keep functional
-    el.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;all:initial;appearance:auto;pointer-events:none;';
-    document.body.appendChild(el);
-    hapticSwitch = el;
+    if (hapticSwitch || typeof document === 'undefined' || !document.body) return;
+    const id = 'mcc-haptic-switch';
+    const label = document.createElement('label');
+    label.setAttribute('for', id);
+    label.setAttribute('aria-hidden', 'true');
+    label.style.cssText = 'position:fixed;top:-200px;left:-200px;width:40px;height:24px;z-index:-1;opacity:0;';
+
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.setAttribute('switch', '');
+    input.id = id;
+    input.tabIndex = -1;
+    // `all:initial` + `appearance:auto` is what triggers iOS's switch render
+    input.style.cssText = 'all:initial;appearance:auto;';
+
+    label.appendChild(input);
+    document.body.appendChild(label);
+    hapticSwitch = label;
 }
 
 function haptic(strength){
     if (!hapticsEnabled) return;
-    // Android / spec-compliant browsers — strength via duration
+    // Android / spec-compliant browsers
     if (navigator.vibrate){
         const ms = strength === 'heavy' ? 40 : strength === 'medium' ? 18 : 7;
         try { navigator.vibrate(ms); } catch(e){}
         return;
     }
-    // iOS fallback — toggle the hidden iOS switch (fires native haptic).
-    // For stronger feedback, fire multiple toggles in quick succession.
+    // iOS — click the label to toggle the switch and fire Taptic Engine.
+    // For heavier feedback, fire multiple toggles in rapid succession.
     ensureHapticSwitch();
     if (!hapticSwitch) return;
     const taps = strength === 'heavy' ? 3 : strength === 'medium' ? 2 : 1;
     for (let i = 0; i < taps; i++){
-        setTimeout(() => { try { hapticSwitch.click(); } catch(e){} }, i * 35);
+        setTimeout(() => { try { hapticSwitch.click(); } catch(e){} }, i * 30);
     }
 }
 
 function initAudio(){
+    // Set up haptic switch alongside audio — both happen on first user tap
+    ensureHapticSwitch();
     if (audioCtx) return;
     try{
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
