@@ -221,6 +221,40 @@ let musicNodes = [];
 let musicEnabled = true;
 let sfxEnabled = true;
 
+// ============================================================
+// HAPTICS — short tactile bumps on key gameplay moments
+// Android etc.: native Vibration API. iOS Safari: ultra-short audio
+// impulse routed through AudioContext, which actuates the speaker
+// briefly enough to wake the Taptic Engine (Lochie-style trick).
+// ============================================================
+let hapticsEnabled = true;
+function haptic(strength){
+    if (!hapticsEnabled) return;
+    // Android / spec-compliant browsers
+    if (navigator.vibrate){
+        const ms = strength === 'heavy' ? 40 : strength === 'medium' ? 18 : 7;
+        try { navigator.vibrate(ms); } catch(e){}
+        return;
+    }
+    // iOS Safari fallback (audioCtx must already be unlocked by a tap)
+    if (!audioCtx) return;
+    const t = audioCtx.currentTime;
+    const dur = strength === 'heavy' ? 0.045 : strength === 'medium' ? 0.022 : 0.010;
+    const samples = Math.ceil(audioCtx.sampleRate * dur);
+    const buf = audioCtx.createBuffer(1, samples, audioCtx.sampleRate);
+    const d = buf.getChannelData(0);
+    const freq = strength === 'heavy' ? 45 : strength === 'medium' ? 70 : 100;
+    for (let i = 0; i < samples; i++){
+        d[i] = Math.sin(2 * Math.PI * freq * (i / audioCtx.sampleRate));
+    }
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    const g = audioCtx.createGain();
+    g.gain.value = 0.0001;   // effectively inaudible
+    src.connect(g); g.connect(audioCtx.destination);
+    src.start(t);
+}
+
 function initAudio(){
     if (audioCtx) return;
     try{
@@ -700,6 +734,7 @@ function gameOver(reason){
     shake = 18;
     flashRed = 1;
     sfxCrash();
+    haptic('heavy');
     stopMusic();
     // TNT hit triggers a big explosion at the player position
     if (reason === 'hit-barrel'){
@@ -1262,6 +1297,9 @@ function updatePlayer(dt){
 
     if (player.landedThisFrame){
         sfxLand();
+        // Haptic — strength scales with how hard we hit
+        const impact = Math.abs(player.lastVy || 0);
+        haptic(impact > 700 ? 'medium' : 'light');
         // Trigger squash, scaled by impact velocity
         player.squash = Math.min(1, Math.abs(player.vy + player.lastVy) * 0.0008 + 0.4);
         for (let i = 0; i < 4; i++){
@@ -1364,6 +1402,7 @@ function checkCollisions(){
                     playTone(660 + nextMilestone * 6, 0.10, 'square', 0.20);
                     setTimeout(() => playTone(990 + nextMilestone * 6, 0.12, 'square', 0.22), 70);
                 }
+                haptic('medium');
                 shake = Math.max(shake, 6);
                 nextMilestone += 10;
             }
@@ -1371,8 +1410,10 @@ function checkCollisions(){
                 sfxCoin();
                 setTimeout(() => sfxCoin(), 80);
                 setTimeout(() => sfxCoin(), 160);
+                haptic('medium');
             } else {
                 sfxCoin();
+                haptic('light');
             }
             // Spawn fly-to-counter visual(s)
             const count = isMega ? 5 : 1;
