@@ -1,0 +1,2581 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0a0418">
+<title>Mine Cart Carnage Endless</title>
+<style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    html,body{
+        width:100%;height:100%;
+        background:#000;
+        overflow:hidden;
+        font-family:'Courier New',monospace;
+        touch-action:none;
+        -webkit-tap-highlight-color:transparent;
+        -webkit-user-select:none;user-select:none;
+        -webkit-touch-callout:none;
+        overscroll-behavior:none;
+    }
+    #wrap{
+        position:fixed;inset:0;
+        display:flex;align-items:center;justify-content:center;
+        background:radial-gradient(ellipse at center,#0a0418 0%,#000 100%);
+    }
+    canvas{
+        display:block;
+        image-rendering:auto;
+        box-shadow:0 0 40px rgba(80,40,150,0.3);
+        max-width:100vw;max-height:100vh;
+        position:relative;
+    }
+    /* CRT scanlines — overlays the canvas, doesn't intercept touches */
+    canvas::after{ content:''; }
+    #wrap::after{
+        content:'';
+        position:fixed;
+        inset:0;
+        pointer-events:none;
+        z-index:5;
+        background:
+            repeating-linear-gradient(
+                0deg,
+                rgba(0,0,0,0.22) 0px,
+                rgba(0,0,0,0.22) 1px,
+                transparent 1px,
+                transparent 3px
+            );
+        mix-blend-mode:multiply;
+    }
+    /* Portrait is fine — game letterboxes itself */
+    #orient{display:none !important}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<div id="orient">
+    <div>
+        <span class="icon">📱</span>
+        Girá el celular<br>
+        <small style="opacity:0.7">para mejor experiencia</small>
+    </div>
+</div>
+<script>
+'use strict';
+
+// ============================================================
+// CANVAS / RESIZE / LAYOUT
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// W/H and gameplay layout are derived from window orientation.
+// LANDSCAPE → 800x450 (wide cinematic view)
+// PORTRAIT  → 540x960 (taller frame, more vertical context)
+let W = 800, H = 450;
+let GROUND_Y = 320;
+let PLAYER_X = 180;
+let TIERS = [240, 280, 320, 360];
+let TIER_DEFAULT = 320;
+let HUD_SCALE = 1;       // multiplier for HUD/menu text + icons
+let SPRITE_SCALE = 1;    // multiplier for player/enemy/barrel sprite sizes
+
+function recomputeLayout(){
+    const ww = window.innerWidth;
+    const wh = window.innerHeight;
+    const portrait = wh > ww;
+    if (portrait){
+        W = 540; H = 960;
+        PLAYER_X = 110;
+        // 5 tiers — 60px deltas for vertigo
+        TIERS = [480, 540, 600, 660, 720];
+        HUD_SCALE = 1.85;
+        SPRITE_SCALE = 1.5;
+    } else {
+        W = 800; H = 450;
+        PLAYER_X = 180;
+        // 5 tiers — 50px deltas
+        TIERS = [200, 250, 300, 350, 400];
+        HUD_SCALE = 1;
+        SPRITE_SCALE = 1;
+    }
+    TIER_DEFAULT = TIERS[Math.floor(TIERS.length / 2)];
+    GROUND_Y = TIER_DEFAULT;
+}
+
+let lastOrientationPortrait = null;
+function resize(){
+    const wasPortrait = lastOrientationPortrait;
+    recomputeLayout();
+    const isPortrait = (W < H);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const ww = window.innerWidth;
+    const wh = window.innerHeight;
+    const s = Math.min(ww / W, wh / H);
+    canvas.style.width = (W * s) + 'px';
+    canvas.style.height = (H * s) + 'px';
+    canvas.width = Math.floor(W * dpr);
+    canvas.height = Math.floor(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    // If orientation flipped while a game is running, restart the world so all
+    // segments use the new TIERS. (Score is reset — small price for consistency.)
+    if (wasPortrait !== null && wasPortrait !== isPortrait){
+        if (typeof state !== 'undefined' && typeof STATE !== 'undefined'){
+            if (state === STATE.PLAYING) startGame();
+            else if (state === STATE.MENU && typeof initMenuWorld === 'function') initMenuWorld();
+        }
+    }
+    lastOrientationPortrait = isPortrait;
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 100));
+resize();
+
+// ============================================================
+// CONSTANTS (gameplay tuning — independent of layout)
+// ============================================================
+const GRAVITY     = 2400;         // px/s^2
+const JUMP_VEL    = -880;         // px/s
+const SHORT_JUMP  = -480;         // when releasing early
+const INIT_SPEED  = 440;          // starting speed px/s — feel fast from the get-go
+const MAX_SPEED   = 760;          // top speed
+const SPEED_RAMP  = 2.4;          // gentler ramp so it doesn't get insane
+const COYOTE_TIME = 0.10;         // forgiveness after walking off edge
+const JUMP_BUFFER = 0.13;         // forgiveness for early jumps
+const MAX_REACHABLE_LIFT = 110;   // banana arc cap above local ground
+
+// Colors (DKC mood)
+const C = {
+    skyTop:    '#0a0418',
+    skyBot:    '#2a1248',
+    fogPurple: '#3a1d5e',
+    fogBlue:   '#1a2050',
+    farCave:   '#0d0820',
+    midCave:   '#1a0e35',
+    nearCave:  '#0a0418',
+    plank:     '#5a3216',
+    plankDark: '#2d1808',
+    plankLight:'#7a4a26',
+    rail:      '#7a7a7a',
+    railDark:  '#2a2a2a',
+    cartWood:  '#6b3410',
+    cartDark:  '#2d1408',
+    cartIron:  '#181818',
+    apeFur:    '#4a2810',
+    apeFurLt:  '#6b3a18',
+    apeFace:   '#c9a370',
+    tieRed:    '#c52020',
+    tieRedDk:  '#7a1010',
+    banana:    '#ffd84a',
+    bananaDk:  '#c98e1a',
+    barrel:    '#7a4218',
+    barrelDk:  '#3a1e08',
+    barrelMet: '#9a9a9a',
+    sparkY:    '#ffe070',
+    crash:     '#ff5040',
+    text:      '#f5d090',
+    textShad:  '#2a1408',
+};
+
+// ============================================================
+// SPRITES — preloaded PNGs from assets/
+// ============================================================
+const SPRITES = {};
+const SPRITE_PATHS = {
+    banana:     'assets/banana.png',
+    cart:       'assets/cart.png',
+    ape:        'assets/ape.png',
+    barrel:     'assets/barrel.png',
+    enemy:      'assets/enemy.png',
+    wheel:      'assets/wheel.png',
+    megabanana: 'assets/megabanana.png',
+    explosion:  'assets/explosion.png',
+    apeLose:    'assets/ape_lose.png',
+    title:      'assets/title.png',
+    caveBG:     'assets/cavebg.png',
+};
+let spritesReady = false;
+function loadSprites(cb){
+    const keys = Object.keys(SPRITE_PATHS);
+    let remaining = keys.length;
+    let failed = 0;
+    keys.forEach(k => {
+        const img = new Image();
+        img.onload = () => { SPRITES[k] = img; if (--remaining === 0) { spritesReady = failed === 0; cb(); } };
+        img.onerror = () => { failed++; if (--remaining === 0) { spritesReady = failed === 0; cb(); } };
+        img.src = SPRITE_PATHS[k];
+    });
+}
+
+// ============================================================
+// AUDIO (Web Audio synthesized SFX + simple loop)
+// ============================================================
+let audioCtx = null;
+let masterGain = null;
+let musicGain = null;
+let musicNodes = [];
+let musicEnabled = true;
+let sfxEnabled = true;
+
+function initAudio(){
+    if (audioCtx) return;
+    try{
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        masterGain = audioCtx.createGain();
+        masterGain.gain.value = 0.6;
+        masterGain.connect(audioCtx.destination);
+        musicGain = audioCtx.createGain();
+        musicGain.gain.value = 0.18;
+        musicGain.connect(masterGain);
+    } catch(e){ audioCtx = null; }
+}
+
+function playTone(freq, duration, type='square', vol=0.3, attack=0.005, decay=0.05){
+    if (!audioCtx || !sfxEnabled) return;
+    const t = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t);
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(vol, t + attack);
+    g.gain.exponentialRampToValueAtTime(0.001, t + duration);
+    osc.connect(g); g.connect(masterGain);
+    osc.start(t);
+    osc.stop(t + duration + 0.05);
+}
+
+function sfxJump(){
+    if (!audioCtx) return;
+    const t = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(220, t);
+    osc.frequency.exponentialRampToValueAtTime(540, t + 0.15);
+    g.gain.setValueAtTime(0.18, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+    osc.connect(g); g.connect(masterGain);
+    osc.start(t); osc.stop(t + 0.2);
+}
+
+function sfxCoin(){
+    if (!audioCtx || !sfxEnabled) return;
+    playTone(880, 0.07, 'square', 0.18);
+    setTimeout(() => playTone(1320, 0.10, 'square', 0.18), 60);
+}
+
+function sfxLand(){
+    if (!audioCtx || !sfxEnabled) return;
+    const t = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(120, t);
+    osc.frequency.exponentialRampToValueAtTime(60, t + 0.08);
+    g.gain.setValueAtTime(0.10, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.10);
+    osc.connect(g); g.connect(masterGain);
+    osc.start(t); osc.stop(t + 0.12);
+}
+
+function sfxCrash(){
+    if (!audioCtx || !sfxEnabled) return;
+    const t = audioCtx.currentTime;
+    // White noise burst
+    const buf = audioCtx.createBuffer(1, audioCtx.sampleRate * 0.6, audioCtx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random()*2 - 1) * Math.pow(1 - i/d.length, 2);
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    const g = audioCtx.createGain();
+    g.gain.value = 0.4;
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(800, t);
+    filter.frequency.exponentialRampToValueAtTime(120, t + 0.5);
+    src.connect(filter); filter.connect(g); g.connect(masterGain);
+    src.start(t);
+    // Down-pitched tone
+    const osc = audioCtx.createOscillator();
+    const og = audioCtx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(180, t);
+    osc.frequency.exponentialRampToValueAtTime(40, t + 0.5);
+    og.gain.setValueAtTime(0.25, t);
+    og.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+    osc.connect(og); og.connect(masterGain);
+    osc.start(t); osc.stop(t + 0.55);
+}
+
+// Tense mine-cart loop (David Wise inspired): A minor, fast 16ths, 8-bar
+// pattern with 4 distinct sections (A, B, A', C) so it doesn't feel monotonous.
+function startMusic(){
+    if (!audioCtx || !musicEnabled) return;
+    stopMusic();
+    const bpm = 156;
+    const sec = 60 / bpm;
+    const stepDur = sec / 4;  // 16th notes
+
+    // === 4 sections × 32 steps each = 128-step (8-bar) loop ===
+    // Notes in Hz. 0 = rest. A natural minor.
+    // Reference: A1=55, G#1=52, G1=49, F#1=46, F1=44, E1=41, D1=37, C1=33, B0=31
+
+    // BASS — 4 sections
+    const bassSections = [
+        // A: chromatic descent A1 → E1 → D1, classic mine cart descent
+        [55, 0, 55,55, 55, 0, 52,52, 55, 0, 55,55, 49, 0, 49,49,
+         46, 0, 46,46, 44, 0, 44,44, 41,41,41, 0, 37,37,46,52],
+        // B: D minor center, octave pump — D1/D2 alternating with walk
+        [37, 0, 73, 0, 37, 0, 73,73, 35, 0, 70, 0, 35, 0, 70,70,
+         33, 0, 65, 0, 33, 0, 65,65, 31, 0, 62, 0, 41,41,46,49],
+        // A': return to A but with octave jumps mid-bar (more energy)
+        [55,110,55, 0, 55, 0, 52,104, 55,110,55, 0, 49, 0, 49,98,
+         46, 92,46, 0, 44, 0, 44,87,  41, 41,41,82, 46,49,52,55],
+        // C: bridge — rapid 8th-note climb, drum-fill territory
+        [55, 55, 62,62, 65,65, 73,73, 77,77, 82,82, 87,87, 92,92,
+         98, 98, 92,92, 87,87, 82,82, 73,73, 65,65, 62,62, 55,55],
+    ];
+
+    // STAB — sparse low-dyad dissonance hits (downbeats only)
+    const stabSections = [
+        // A: every 8 steps
+        [1,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0],
+        // B: more sparse
+        [1,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0],
+        // A': drives more — every 4
+        [1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0],
+        // C: bridge silent (lead/bass carry it)
+        [0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0],
+    ];
+
+    // PULSE — high-register racing texture (sawtooth, ghost volume)
+    const pulseSections = [
+        // A: alternating 5th/tritone
+        [440,415,440,466, 415,440,415,392, 440,415,440,466, 392,415,392,370,
+         370,392,370,415, 349,370,349,392, 311,330,311,349, 349,370,392,415],
+        // B: lower texture, slower (8ths feel)
+        [349,0,349,0, 392,0,349,0, 311,0,311,0, 349,0,311,0,
+         294,0,294,0, 330,0,294,0, 247,0,247,0, 294,330,349,392],
+        // A' echo of A but transposed
+        [466,440,466,494, 440,466,440,415, 466,440,466,494, 415,440,415,392,
+         392,415,392,440, 370,392,370,415, 330,349,330,370, 370,392,415,440],
+        // C: rapid descending arpeggio
+        [659,622,587,554, 523,494,466,440, 415,392,370,349, 330,311,294,277,
+         262,294,330,349, 392,415,440,466, 494,523,554,587, 622,659,698,740],
+    ];
+
+    // LEAD — character motif. Mostly silent in A; melodic phrase in B and A'.
+    const leadSections = [
+        // A: silent (let bass/pulse do the work)
+        new Array(32).fill(0),
+        // B: descending melody, half-note feel
+        [880, 0, 0, 0,   784, 0, 0, 0,   698, 0, 0, 0,   587, 0, 0, 0,
+         523, 0, 0, 0,   587, 0, 587, 0, 698, 0, 784, 0, 880, 0, 0, 0],
+        // A' echo motif
+        [0,   0, 0, 0,   880, 0, 784, 0, 698, 0, 0,   0, 0,   0, 0, 0,
+         0,   0, 0, 0,   784, 0, 698, 0, 587, 0, 523, 0, 0,   0, 0, 0],
+        // C: descending arpeggio flourish into the loop top
+        [1175,0, 1047,0, 988,0, 880,0, 784,0, 698,0, 587,0, 523,0,
+         494,0, 440,0,  392,0,  349,0, 330,0, 311,0, 294,0, 262, 0],
+    ];
+
+    const SECTION_LEN = 32;
+    const NUM_SECTIONS = bassSections.length;
+    const beats = SECTION_LEN * NUM_SECTIONS;
+    let step = 0;
+    let nextTime = audioCtx.currentTime + 0.05;
+
+    function noteOsc(freq, t, dur, gainPeak, type, attack=0.005, releaseFrac=0.85){
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.type = type;
+        o.frequency.setValueAtTime(freq, t);
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(gainPeak, t + attack);
+        g.gain.exponentialRampToValueAtTime(0.001, t + dur * releaseFrac);
+        o.connect(g); g.connect(musicGain);
+        o.start(t); o.stop(t + dur + 0.02);
+        musicNodes.push(o);
+    }
+
+    function noise(t, dur, gainPeak, lpHz=4000){
+        const buf = audioCtx.createBuffer(1, Math.max(1, audioCtx.sampleRate * dur), audioCtx.sampleRate);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < d.length; i++) d[i] = (Math.random()*2 - 1) * Math.pow(1 - i/d.length, 3);
+        const src = audioCtx.createBufferSource();
+        src.buffer = buf;
+        const filter = audioCtx.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.frequency.value = lpHz;
+        const g = audioCtx.createGain();
+        g.gain.value = gainPeak;
+        src.connect(filter); filter.connect(g); g.connect(musicGain);
+        src.start(t);
+        musicNodes.push(src);
+    }
+
+    function schedule(){
+        if (!audioCtx || !musicEnabled) return;
+        while (nextTime < audioCtx.currentTime + 0.25){
+            const t = nextTime;
+            const i = step % beats;
+            const sec = Math.floor(i / SECTION_LEN);
+            const si = i % SECTION_LEN;
+            const isLastBar = (sec === NUM_SECTIONS - 1);  // C bridge
+
+            // Bass — punchy triangle
+            const b = bassSections[sec][si];
+            if (b > 0) noteOsc(b, t, stepDur * 1.6, 0.55, 'triangle', 0.003, 0.7);
+
+            // Stab — low minor-2nd dyad
+            if (stabSections[sec][si]){
+                noteOsc(110, t, stepDur * 3.5, 0.18, 'square', 0.01, 0.55);
+                noteOsc(117, t, stepDur * 3.5, 0.10, 'square', 0.01, 0.55);
+            }
+
+            // High pulse — sawtooth racing texture
+            const p = pulseSections[sec][si];
+            if (p > 0) noteOsc(p, t, stepDur * 0.8, 0.05, 'sawtooth', 0.002, 0.6);
+
+            // Lead motif (square, melodic)
+            const l = leadSections[sec][si];
+            if (l > 0) noteOsc(l, t, stepDur * 2.5, 0.13, 'square', 0.005, 0.65);
+
+            // Hi-hat every 16th, accent on downbeats; opens up at end of bridge
+            const isFill = isLastBar && si >= 28;
+            const hatVol = isFill ? 0.10 : ((si % 4 === 0) ? 0.07 : 0.025);
+            noise(t, isFill ? 0.06 : 0.04, hatVol, 6000);
+
+            // Snare on backbeats (steps 4, 12, 20, 28 within section)
+            if (si % 8 === 4){
+                noise(t, 0.08, 0.08, 1200);
+                noteOsc(180, t, 0.06, 0.15, 'square', 0.002, 0.5);
+            }
+            // Kick on every downbeat (every 4 steps); double-kick on bridge end
+            if (si % 4 === 0){
+                noteOsc(60, t, 0.10, 0.45, 'sine', 0.001, 0.4);
+            }
+            // Drum fill on the very last 4 steps of the loop
+            if (isLastBar && si >= 28){
+                // Snare roll into the loop top
+                noise(t, 0.04, 0.12, 2200);
+                noteOsc(220 - (si - 28) * 20, t, 0.05, 0.2, 'square', 0.002, 0.4);
+            }
+
+            step++;
+            nextTime += stepDur;
+        }
+        if (musicEnabled){
+            musicScheduleId = setTimeout(schedule, 60);
+        }
+    }
+    schedule();
+}
+let musicScheduleId = null;
+function stopMusic(){
+    if (musicScheduleId){ clearTimeout(musicScheduleId); musicScheduleId = null; }
+    for (const n of musicNodes){
+        try { n.stop(); } catch(e){}
+    }
+    musicNodes = [];
+}
+
+// ============================================================
+// GAME STATE
+// ============================================================
+const STATE = { MENU:0, PLAYING:1, DEAD:2 };
+let state = STATE.MENU;
+
+let worldX = 0;          // distance scrolled
+let speed = INIT_SPEED;  // current px/s
+let timePlaying = 0;     // seconds in current run
+
+// Player
+const player = {
+    y: GROUND_Y - 50,
+    vy: 0,
+    h: 50,
+    w: 64,
+    onGround: true,
+    coyote: 0,
+    bufferedJump: 0,
+    jumpHeld: false,
+    landedThisFrame: false,
+    deadFrame: 0,
+};
+
+// World objects
+let segments = [];   // { x, w, type: 'TRACK'|'GAP', danger:bool }
+let bananas = [];    // { x, y, taken, anim }
+let obstacles = [];  // { x, y, type:'BARREL'|'CART_ENEMY', vx, hit }
+let particles = [];  // visual only
+let nextSpawnX = 0;
+
+// Score / progression
+let score = 0;            // bananas
+let distance = 0;         // metres-ish
+let bestDist = parseInt(localStorage.getItem('mcc_best_d') || '0');
+let bestBan  = parseInt(localStorage.getItem('mcc_best_b') || '0');
+
+// FX
+let shake = 0;
+let flashRed = 0;
+let flyingBananas = [];   // visual: bananas flying to HUD on collect
+let hudPulse = 0;         // 0..1, pulses when a banana arrives at the counter
+let explosions = [];      // {x, y, t, dur} — TNT explosion FX
+let deathReason = null;   // 'fall' | 'hit-barrel' | 'hit-cart' — drives game-over visuals
+
+// ============================================================
+// INPUT
+// ============================================================
+const keys = {};
+let pendingAction = false;
+
+function pressJump(canvasX, canvasY){
+    initAudio();
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    // On menu / game-over, check button hits first
+    if ((state === STATE.MENU || state === STATE.DEAD) && canvasX != null){
+        if (tryHitButton(canvasX, canvasY)) return;
+    }
+    if (state === STATE.MENU){
+        startGame();
+        return;
+    }
+    if (state === STATE.DEAD){
+        if (player.deadFrame > 0.6) startGame();
+        return;
+    }
+    // Buffered jump
+    player.bufferedJump = JUMP_BUFFER;
+    player.jumpHeld = true;
+}
+function releaseJump(){ player.jumpHeld = false; }
+
+window.addEventListener('keydown', e => {
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW'){
+        if (!keys[e.code]) pressJump();
+        keys[e.code] = true;
+        e.preventDefault();
+    }
+    if (e.code === 'KeyM'){
+        musicEnabled = !musicEnabled;
+        if (musicEnabled && state === STATE.PLAYING) startMusic();
+        else stopMusic();
+    }
+});
+window.addEventListener('keyup', e => {
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW'){
+        keys[e.code] = false;
+        releaseJump();
+    }
+});
+canvas.addEventListener('touchstart', e => { e.preventDefault(); const p = eventToCanvas(e); pressJump(p.x, p.y); }, {passive:false});
+canvas.addEventListener('touchend',   e => { e.preventDefault(); releaseJump(); }, {passive:false});
+canvas.addEventListener('touchcancel',e => { e.preventDefault(); releaseJump(); }, {passive:false});
+canvas.addEventListener('mousedown',  e => { e.preventDefault(); const p = eventToCanvas(e); pressJump(p.x, p.y); });
+canvas.addEventListener('mouseup',    e => { e.preventDefault(); releaseJump(); });
+
+// ============================================================
+// GAME FLOW
+// ============================================================
+function startGame(){
+    state = STATE.PLAYING;
+    worldX = 0;
+    speed = INIT_SPEED;
+    timePlaying = 0;
+    player.y = TIER_DEFAULT - player.h;
+    player.vy = 0;
+    player.onGround = true;
+    player.groundY = TIER_DEFAULT;
+    player.coyote = 0;
+    player.bufferedJump = 0;
+    player.deadFrame = 0;
+    player.squash = 0;
+    player.airTime = 0;
+    segments.length = 0;
+    bananas.length  = 0;
+    obstacles.length = 0;
+    particles.length = 0;
+    nextSpawnX = 0;
+    score = 0;
+    distance = 0;
+    shake = 0;
+    flashRed = 0;
+    flyingBananas.length = 0;
+    hudPulse = 0;
+    explosions.length = 0;
+    deathReason = null;
+    // Generate initial flat starting track at default tier
+    segments.push({ x: -200, w: 1200, type:'TRACK', y: TIER_DEFAULT });
+    nextSpawnX = 1000;
+    if (audioCtx) startMusic();
+}
+
+function gameOver(reason){
+    if (state !== STATE.PLAYING) return;
+    state = STATE.DEAD;
+    deathReason = reason || 'fall';
+    player.deadFrame = 0;
+    shake = 18;
+    flashRed = 1;
+    sfxCrash();
+    stopMusic();
+    // TNT hit triggers a big explosion at the player position
+    if (reason === 'hit-barrel'){
+        explosions.push({
+            x: worldX + PLAYER_X + 32,   // world coords
+            y: player.y + 18,
+            t: 0,
+            dur: 0.8,
+            scale: 1.6,
+        });
+        shake = 26;
+        flashRed = 1;
+    }
+    // Persist best
+    distance = Math.floor(worldX / 10);
+    if (distance > bestDist){ bestDist = distance; localStorage.setItem('mcc_best_d', bestDist); }
+    if (score > bestBan){ bestBan = score; localStorage.setItem('mcc_best_b', bestBan); }
+    // Crash particles
+    for (let i = 0; i < 30; i++){
+        particles.push({
+            x: PLAYER_X + 30, y: player.y + 25,
+            vx: (Math.random()-0.5) * 400,
+            vy: (Math.random()-0.7) * 600,
+            life: 0.6 + Math.random()*0.5,
+            color: ['#7a4a26','#3a1e08','#a05030','#222'][i%4],
+            size: 2 + Math.random()*4,
+            grav: 1400,
+        });
+    }
+}
+
+// ============================================================
+// PROCEDURAL GENERATION
+// ============================================================
+// Difficulty 0..1 based on speed
+function diff(){
+    return Math.min(1, (speed - INIT_SPEED) / (MAX_SPEED - INIT_SPEED));
+}
+
+function rand(min, max){ return min + Math.random() * (max - min); }
+function rint(min, max){ return Math.floor(rand(min, max+1)); }
+
+// Pick the next tier with a strong bias toward CHANGING (variety!).
+// Step is mostly ±1 (40px) but occasionally ±2 (80px). Clamped to TIERS range.
+function pickNextTier(currentY, allowBigStep){
+    let idx = TIERS.indexOf(currentY);
+    if (idx < 0) idx = TIERS.indexOf(TIER_DEFAULT);
+    // Build weighted choices: up1, down1, up2, down2, stay (small weight)
+    const opts = [];
+    if (idx > 0) opts.push({ y: TIERS[idx - 1], w: 4 });
+    if (idx < TIERS.length - 1) opts.push({ y: TIERS[idx + 1], w: 4 });
+    if (allowBigStep && idx > 1) opts.push({ y: TIERS[idx - 2], w: 1 });
+    if (allowBigStep && idx < TIERS.length - 2) opts.push({ y: TIERS[idx + 2], w: 1 });
+    opts.push({ y: currentY, w: 1 });   // stay (rare)
+    const total = opts.reduce((a, o) => a + o.w, 0);
+    let r = Math.random() * total;
+    for (const o of opts){
+        r -= o.w;
+        if (r <= 0) return o.y;
+    }
+    return currentY;
+}
+
+// Place bananas ALONG the player's actual jump parabola.
+//   jumpX     : world x where the player's center is at the moment of jumping
+//   surfaceY  : surface y at the launch (player center starts at surfaceY - 25)
+//   atSpeed   : horizontal speed during the jump
+//   tStart..tEnd : range of normalized airtime (0..0.733 sec) to populate
+//   count     : number of bananas
+// Result: each banana sits on the player's center trajectory → guaranteed catchable
+function spawnJumpArc(jumpX, surfaceY, atSpeed, tStart, tEnd, count){
+    for (let i = 0; i < count; i++){
+        const ti = count > 1 ? tStart + (i / (count - 1)) * (tEnd - tStart) : (tStart + tEnd) * 0.5;
+        const x = jumpX + atSpeed * ti;
+        // Player center: y = (surface - 25) + vy*t + 0.5*g*t² with vy=-880, g=2400
+        const y = (surfaceY - 25) + (-880 * ti + 1200 * ti * ti);
+        bananas.push({ x, y, taken: false, anim: Math.random() * 6 });
+    }
+}
+
+// Place bananas in a straight horizontal line just above the surface (ground-level run).
+// Optionally skip any banana that would land within `skipR` of `skipX`
+// (used so regular bananas don't visually overlap a mega-banana in the same row).
+function spawnGroundLine(x1, x2, surfaceY, count, skipX = null, skipR = 0){
+    for (let i = 0; i < count; i++){
+        const t = count > 1 ? i / (count - 1) : 0.5;
+        const x = x1 + (x2 - x1) * t;
+        if (skipX !== null && Math.abs(x - skipX) < skipR) continue;
+        bananas.push({
+            x, y: surfaceY - 30,
+            taken: false,
+            anim: Math.random() * 6,
+        });
+    }
+}
+
+function spawnMegaBanana(x, y){
+    bananas.push({ x, y, taken:false, anim: Math.random() * 6, mega: true });
+}
+
+function spawnAhead(){
+    while (nextSpawnX < worldX + W * 2){
+        const d = diff();
+        const r = Math.random();
+        const last = segments[segments.length - 1];
+        const lastY = endY(last);
+
+        // === STACKED bonus (~15%) — 6 variation types ===
+        if (r < 0.15 && lastY >= TIERS[1]){
+            const yLow = lastY;
+            // Vary height per instance — no two STACKEDs feel the same
+            const yHigh = yLow - rint(105, 165);
+            const w = rand(380, 620);    // shorter than before
+            const variant = Math.floor(Math.random() * 6);
+
+            // Always push the segment at full width — variants alter content
+            segments.push({ x: nextSpawnX, w, type:'STACKED', yHigh, yLow });
+
+            // Easy bananas on the low rail (always)
+            spawnGroundLine(nextSpawnX + 60, nextSpawnX + w - 60, yLow, rint(3, 5));
+
+            const MEGA_SKIP = 70;  // px — exclusion radius around mega-banana
+            const MEGA_LIFT = 56;  // px above ground (well clear of regulars at -30)
+
+            if (variant === 0){
+                // A: classic — mega on high, bonus bananas, optional low barrel
+                const megaX = nextSpawnX + w * 0.5;
+                spawnGroundLine(nextSpawnX + 80, nextSpawnX + w - 80, yHigh, rint(3, 4), megaX, MEGA_SKIP);
+                spawnMegaBanana(megaX, yHigh - MEGA_LIFT);
+                if (Math.random() < 0.45){
+                    obstacles.push({ x: nextSpawnX + w * 0.5, y: yLow, type: 'BARREL', vx: 0, hit: false });
+                }
+            } else if (variant === 1){
+                // B: ENEMY ON HIGH — mega still up there, but you have to dodge
+                const megaX = nextSpawnX + w * 0.85;
+                spawnGroundLine(nextSpawnX + 80, nextSpawnX + w * 0.4, yHigh, rint(2, 3), megaX, MEGA_SKIP);
+                spawnMegaBanana(megaX, yHigh - MEGA_LIFT);
+                obstacles.push({
+                    x: nextSpawnX + w + rand(80, 200),
+                    y: yHigh, type: 'CART_ENEMY',
+                    vx: -(120 + d * 160), hit: false,
+                });
+            } else if (variant === 2){
+                // C: BARREL ON LOW — high is the safe escape
+                const megaX = nextSpawnX + w * 0.6;
+                spawnGroundLine(nextSpawnX + 80, nextSpawnX + w - 80, yHigh, rint(3, 5), megaX, MEGA_SKIP);
+                spawnMegaBanana(megaX, yHigh - MEGA_LIFT);
+                obstacles.push({
+                    x: nextSpawnX + w * (0.40 + Math.random() * 0.2),
+                    y: yLow, type: 'BARREL', vx: 0, hit: false,
+                });
+            } else if (variant === 3){
+                // D: GAP IN LOW — middle has only the HIGH rail; low is abyss
+                const gapStart = nextSpawnX + w * 0.35;
+                const gapW = w * 0.30;
+                segments.pop();
+                segments.push({ x: nextSpawnX, w: gapStart - nextSpawnX,
+                                type:'STACKED', yHigh, yLow });
+                segments.push({ x: gapStart, w: gapW, type:'TRACK', y: yHigh });
+                segments.push({ x: gapStart + gapW, w: nextSpawnX + w - (gapStart + gapW),
+                                type:'STACKED', yHigh, yLow });
+                const megaX = gapStart + gapW * 0.5;
+                spawnGroundLine(nextSpawnX + 80, nextSpawnX + w - 80, yHigh, rint(4, 6), megaX, MEGA_SKIP);
+                spawnMegaBanana(megaX, yHigh - MEGA_LIFT);
+            } else if (variant === 4){
+                // E: GAP IN HIGH — high is shorter, mega still on what remains
+                const highEnd = nextSpawnX + w * 0.55;
+                segments.pop();
+                segments.push({ x: nextSpawnX, w: highEnd - nextSpawnX,
+                                type:'STACKED', yHigh, yLow });
+                segments.push({ x: highEnd, w: nextSpawnX + w - highEnd,
+                                type:'TRACK', y: yLow });
+                const megaX = nextSpawnX + (highEnd - nextSpawnX) * 0.5;
+                spawnGroundLine(nextSpawnX + 60, highEnd - 30, yHigh, rint(3, 4), megaX, MEGA_SKIP);
+                spawnMegaBanana(megaX, yHigh - MEGA_LIFT);
+            } else {
+                // F: SLOPED HIGH RAIL — visually a ramp on top, low rail flat
+                segments.pop();
+                const highDelta = rint(40, 70) * (Math.random() < 0.5 ? -1 : 1);
+                const yHighL = yHigh + (highDelta < 0 ? Math.abs(highDelta) : 0);
+                const yHighR = yHigh + (highDelta > 0 ? highDelta : 0);
+                segments.push({ x: nextSpawnX, w, type:'STACKED',
+                                yHigh, yLow, yHighL, yHighR });
+                // Bananas follow the slope of the high rail
+                const count = rint(4, 6);
+                for (let i = 0; i < count; i++){
+                    const t = (i + 0.5) / count;
+                    const x = nextSpawnX + 60 + (w - 120) * t;
+                    const y = yHighL + (yHighR - yHighL) * ((x - nextSpawnX) / w) - 30;
+                    bananas.push({ x, y, taken:false, anim: Math.random() * 6 });
+                }
+                // Mega at the LOWER end of the slope (most reachable)
+                const megaAtRight = yHighR > yHighL;  // bigger y = lower
+                const megaX = megaAtRight ? nextSpawnX + w - 60 : nextSpawnX + 60;
+                const megaY = (megaAtRight ? yHighR : yHighL) - MEGA_LIFT;
+                spawnMegaBanana(megaX, megaY);
+            }
+
+            nextSpawnX += w;
+            continue;
+        }
+
+        // === VALLEY (~7%) — sharp drop, flat low ride, climb back up ===
+        if (r < 0.22 && lastY <= TIERS[TIERS.length - 2]){
+            const dropY = TIERS[TIERS.length - 1];   // bottom tier
+            const downSlopeW = rand(140, 200);
+            segments.push({ x: nextSpawnX, w: downSlopeW, type:'SLOPE',
+                            y1: lastY, y2: dropY });
+            const valleyW = rand(180, 320);
+            segments.push({ x: nextSpawnX + downSlopeW, w: valleyW,
+                            type:'TRACK', y: dropY });
+            // Climb back to a normal tier
+            const climbToIdx = Math.max(0, TIERS.indexOf(dropY) - 2);
+            const climbY = TIERS[climbToIdx];
+            const upSlopeW = rand(140, 220);
+            segments.push({
+                x: nextSpawnX + downSlopeW + valleyW, w: upSlopeW,
+                type:'SLOPE', y1: dropY, y2: climbY,
+            });
+            // Bananas along the valley floor + maybe a mega in the middle
+            const hasMega = Math.random() < 0.55;
+            const megaX = nextSpawnX + downSlopeW + valleyW * 0.5;
+            spawnGroundLine(nextSpawnX + downSlopeW + 30,
+                            nextSpawnX + downSlopeW + valleyW - 30,
+                            dropY, rint(4, 6),
+                            hasMega ? megaX : null, 70);
+            if (hasMega){
+                spawnMegaBanana(megaX, dropY - 56);
+            }
+            nextSpawnX += downSlopeW + valleyW + upSlopeW;
+            continue;
+        }
+
+        if (r < 0.30){
+            // FLAT TRACK — short stretches, more often a barrel for risk
+            const w = rand(140, 240);
+            segments.push({ x: nextSpawnX, w, type:'TRACK', y: lastY });
+
+            if (Math.random() < 0.32 + d * 0.20 && w > 180){
+                obstacles.push({
+                    x: nextSpawnX + w * (0.4 + Math.random() * 0.3),
+                    y: lastY, type: 'BARREL', vx: 0, hit: false,
+                });
+            }
+            if (Math.random() < 0.30){
+                spawnGroundLine(nextSpawnX + 50, nextSpawnX + w - 50, lastY, rint(2, 3));
+            }
+            nextSpawnX += w;
+        } else if (r < 0.42){
+            // SLOPE — inclined track, sometimes 2-tier for steepness
+            const big = Math.random() < 0.30;
+            const newY = pickNextTier(lastY, big);
+            const targetY = newY === lastY
+                ? (lastY === TIERS[0] ? TIERS[1] : TIERS[Math.max(0, TIERS.indexOf(lastY) - 1)])
+                : newY;
+            const delta = Math.abs(targetY - lastY);
+            const w = rand(120, 180) + delta * 1.3;
+            segments.push({ x: nextSpawnX, w, type:'SLOPE', y1: lastY, y2: targetY });
+
+            if (Math.random() < 0.45){
+                const count = rint(2, 3);
+                for (let i = 0; i < count; i++){
+                    const t = count > 1 ? (i + 0.5) / count : 0.5;
+                    const x = nextSpawnX + w * t;
+                    const y = lastY + (targetY - lastY) * t - 30;
+                    bananas.push({ x, y, taken:false, anim: Math.random() * 6 });
+                }
+            }
+            nextSpawnX += w;
+        } else if (r < 0.88){
+            // GAP — bumped to ~46% of segments. Landing sometimes a SLOPE.
+            const newY = pickNextTier(lastY, d > 0.4);
+            const heightDelta = newY - lastY;
+            const goingUp = heightDelta < 0;
+
+            let gw;
+            if (goingUp){
+                const climb = -heightDelta;
+                gw = rand(80, Math.max(110, 160 - climb * 0.5 + d * 60));
+            } else if (heightDelta > 0){
+                gw = rand(120, 240 + d * 100);
+            } else {
+                gw = rand(110, 200 + d * 80);
+            }
+
+            const gapX = nextSpawnX;
+            segments.push({ x: gapX, w: gw, type:'GAP' });
+
+            // Landing: short flat OR a SLOPE (35% chance) — like DKC ramps
+            const landingIsSlope = Math.random() < 0.35;
+            const lw = rand(140, 240);
+            if (landingIsSlope){
+                // Slope continues away from newY in either direction
+                const slopeDir = Math.random() < 0.6 ? 1 : -1;  // bias downhill
+                const slopeIdx = TIERS.indexOf(newY);
+                const altIdx = Math.max(0, Math.min(TIERS.length - 1, slopeIdx + slopeDir));
+                const yEnd = TIERS[altIdx];
+                if (yEnd === newY){
+                    // No tier room → fall back to flat
+                    segments.push({ x: gapX + gw, w: lw, type:'TRACK', y: newY });
+                } else {
+                    segments.push({ x: gapX + gw, w: lw, type:'SLOPE', y1: newY, y2: yEnd });
+                }
+            } else {
+                segments.push({ x: gapX + gw, w: lw, type:'TRACK', y: newY });
+            }
+
+            if (Math.random() < 0.7){
+                const jumpX = gapX - 40;
+                const tEnd = goingUp ? 0.55 : 0.65;
+                spawnJumpArc(jumpX, lastY, speed, 0.10, tEnd, rint(3, 4));
+            }
+
+            nextSpawnX = gapX + gw + lw;
+        } else {
+            // TRACK with oncoming cart enemy — shorter approach
+            const w = rand(180, 300);
+            segments.push({ x: nextSpawnX, w, type:'TRACK', y: lastY });
+            obstacles.push({
+                x: nextSpawnX + w + rand(80, 200),
+                y: lastY,
+                type: 'CART_ENEMY',
+                vx: -(80 + d * 140),
+                hit: false,
+            });
+            nextSpawnX += w;
+        }
+    }
+
+    // Cull old segments / objects
+    const cullX = worldX - W * 0.75;
+    segments  = segments.filter(s => s.x + s.w > cullX);
+    bananas   = bananas.filter(b => (b.x > cullX && !b.taken) || (b.taken && b.anim < 1.0));
+    obstacles = obstacles.filter(o => o.x > cullX - 200 && o.x < worldX + W * 3);
+    particles = particles.filter(p => p.life > 0);
+}
+
+// ============================================================
+// QUERIES
+// ============================================================
+// Surface y at world x for a single segment (interpolated for slopes).
+function surfaceY(s, wx){
+    if (s.type === 'TRACK') return s.y;
+    if (s.type === 'SLOPE'){
+        const t = Math.max(0, Math.min(1, (wx - s.x) / s.w));
+        return s.y1 + (s.y2 - s.y1) * t;
+    }
+    return null;
+}
+
+// HIGH-rail y at a world x in a STACKED segment (supports a sloped high rail
+// when yHighL / yHighR are set; otherwise constant yHigh).
+function highY(s, wx){
+    if (s.yHighL !== undefined && s.yHighR !== undefined){
+        const t = Math.max(0, Math.min(1, (wx - s.x) / s.w));
+        return s.yHighL + (s.yHighR - s.yHighL) * t;
+    }
+    return s.yHigh;
+}
+
+// All possible surface y values at a given world x. Returns [] over a gap.
+function surfacesAt(wx){
+    for (const s of segments){
+        if (wx >= s.x && wx < s.x + s.w){
+            if (s.type === 'GAP') return [];
+            if (s.type === 'STACKED') return [highY(s, wx), s.yLow];
+            return [surfaceY(s, wx)];
+        }
+    }
+    return [];
+}
+
+// Single surface query — back-compat for places that just want "the ground here".
+// Picks the surface nearest to refY (preserves your current track on STACKED).
+function groundAt(wx, refY){
+    const all = surfacesAt(wx);
+    if (all.length === 0) return null;
+    if (all.length === 1) return all[0];
+    if (refY == null) return all[all.length - 1];  // default: lowest (largest y)
+    let best = all[0], bestD = Math.abs(all[0] - refY);
+    for (const s of all){
+        const d = Math.abs(s - refY);
+        if (d < bestD){ best = s; bestD = d; }
+    }
+    return best;
+}
+
+// Y of the END (right side) of the most recent segment — for spawn chaining.
+function endY(s){
+    if (!s) return TIER_DEFAULT;
+    if (s.type === 'TRACK') return s.y;
+    if (s.type === 'SLOPE') return s.y2;
+    if (s.type === 'STACKED') return s.yLow;  // continue from the low track
+    return TIER_DEFAULT;
+}
+
+// ============================================================
+// UPDATE
+// ============================================================
+function update(dt){
+    if (state === STATE.PLAYING){
+        timePlaying += dt;
+        speed = Math.min(MAX_SPEED, INIT_SPEED + timePlaying * SPEED_RAMP);
+        worldX += speed * dt;
+        spawnAhead();
+        updatePlayer(dt);
+        updateObstacles(dt);
+        updateBananas(dt);
+        checkCollisions();
+        distance = Math.floor(worldX / 10);
+    } else if (state === STATE.DEAD){
+        player.deadFrame += dt;
+        // continue physics for player falling
+        player.vy += GRAVITY * dt;
+        player.y += player.vy * dt;
+    } else if (state === STATE.MENU){
+        // Animate bananas in the background scroll
+        for (const b of bananas) b.anim += dt * 4;
+    }
+    // Particles always
+    for (const p of particles){
+        p.life -= dt;
+        if (p.grav) p.vy += p.grav * dt;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+    }
+    // Flying bananas → HUD
+    for (let i = flyingBananas.length - 1; i >= 0; i--){
+        const f = flyingBananas[i];
+        f.t += dt;
+        f.spin += dt * 14;
+        if (f.t >= f.dur){
+            flyingBananas.splice(i, 1);
+            hudPulse = 1;
+        }
+    }
+    // Explosions
+    for (let i = explosions.length - 1; i >= 0; i--){
+        const e = explosions[i];
+        e.t += dt;
+        if (e.t >= e.dur) explosions.splice(i, 1);
+    }
+    // FX decay
+    if (shake > 0) shake = Math.max(0, shake - dt * 30);
+    if (flashRed > 0) flashRed = Math.max(0, flashRed - dt * 1.6);
+    if (hudPulse > 0) hudPulse = Math.max(0, hudPulse - dt * 4);
+}
+
+function updatePlayer(dt){
+    // Coyote / buffer timers + animation timers
+    if (player.onGround){
+        player.coyote = COYOTE_TIME;
+        player.airTime = 0;
+    } else {
+        player.coyote = Math.max(0, player.coyote - dt);
+        player.airTime = (player.airTime || 0) + dt;
+    }
+    if (player.bufferedJump > 0) player.bufferedJump -= dt;
+    // Squash decays after landing
+    if (player.squash > 0) player.squash = Math.max(0, player.squash - dt * 6);
+
+    const playerWX = worldX + PLAYER_X + player.w * 0.5;
+
+    // Buffered jump (consumes coyote)
+    let justJumped = false;
+    if (player.bufferedJump > 0 && player.coyote > 0){
+        const jumpFromY = player.y + player.h;
+        player.vy = JUMP_VEL;
+        player.onGround = false;
+        player.coyote = 0;
+        player.bufferedJump = 0;
+        justJumped = true;
+        sfxJump();
+        for (let i = 0; i < 6; i++){
+            particles.push({
+                x: PLAYER_X + 20 + Math.random()*30, y: jumpFromY - 2,
+                vx: (Math.random()-0.5)*120, vy: -Math.random()*100,
+                life: 0.3 + Math.random()*0.2,
+                color: '#7a5a3a',
+                size: 2 + Math.random()*2,
+                grav: 200,
+            });
+        }
+    }
+
+    // Variable jump (analog) — release transition cuts upward momentum
+    if (player.wasHeld && !player.jumpHeld && player.vy < 0){
+        player.vy *= 0.5;   // tap-release = small hop; mid-release = medium
+    }
+    player.wasHeld = player.jumpHeld;
+
+    player.landedThisFrame = false;
+
+    if (player.onGround && !justJumped){
+        // Stick to the surface NEAREST to our current track (handles slopes
+        // smoothly; on STACKED, keeps you on whichever rail you're currently on).
+        const sg = groundAt(playerWX, player.groundY);
+        if (sg !== null && Math.abs(sg - player.groundY) <= 25){
+            player.y = sg - player.h;
+            player.vy = 0;
+            player.groundY = sg;
+        } else {
+            // No surface here, or it dropped/rose too much (e.g. STACKED ended
+            // and our high track disappeared) → become airborne and fall.
+            player.onGround = false;
+        }
+    }
+
+    if (!player.onGround){
+        // Airborne: variable gravity. Holding jump while ascending = lower
+        // gravity → higher jump. Releasing or descending = full gravity.
+        const gnow = (player.jumpHeld && player.vy < 0) ? GRAVITY * 0.82 : GRAVITY;
+        player.vy += gnow * dt;
+        player.y += player.vy * dt;
+        if (player.vy >= 0){
+            // Try each available surface from highest to lowest; land on the first
+            // we crossed this frame.
+            const all = surfacesAt(playerWX).slice().sort((a, b) => a - b);
+            const feet = player.y + player.h;
+            const sweepLimit = player.vy * dt + 4;
+            for (const sy of all){
+                const overshoot = feet - sy;
+                if (overshoot >= 0 && overshoot <= sweepLimit){
+                    player.y = sy - player.h;
+                    player.vy = 0;
+                    player.onGround = true;
+                    player.groundY = sy;
+                    player.landedThisFrame = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (player.landedThisFrame){
+        sfxLand();
+        // Trigger squash, scaled by impact velocity
+        player.squash = Math.min(1, Math.abs(player.vy + player.lastVy) * 0.0008 + 0.4);
+        for (let i = 0; i < 4; i++){
+            particles.push({
+                x: PLAYER_X + 20 + Math.random()*30, y: (player.groundY || TIER_DEFAULT) - 2,
+                vx: (Math.random()-0.5)*80, vy: -Math.random()*60,
+                life: 0.25 + Math.random()*0.2,
+                color: '#5a3a1e',
+                size: 1.5 + Math.random()*2,
+                grav: 200,
+            });
+        }
+    }
+    player.lastVy = player.vy;
+
+    // Fell into the abyss (below the lowest possible track surface)
+    const LOWEST = TIERS[TIERS.length - 1];
+    if (player.y > LOWEST + 10){
+        gameOver('fall');
+    }
+}
+
+function updateObstacles(dt){
+    for (const o of obstacles){
+        o.x += o.vx * dt;
+        // Carts ride the rail — snap their y to whatever surface is under them
+        // (when they spawn, the world ahead can change before they reach the
+        // player, leaving them "floating" if we don't re-check each frame).
+        if (o.type === 'CART_ENEMY'){
+            const g = groundAt(o.x, o.y);
+            if (g !== null) o.y = g;
+            // If over a gap, leave o.y at last good value — they'll be off
+            // screen quickly anyway.
+        }
+    }
+}
+
+function updateBananas(dt){
+    for (const b of bananas){
+        b.anim += dt * 4;
+        if (b.taken) b.anim = (b.anim || 0); // pulses already added on take
+    }
+}
+
+function aabb(ax, ay, aw, ah, bx, by, bw, bh){
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+}
+
+function checkCollisions(){
+    const px = worldX + PLAYER_X + 6;
+    const py = player.y + 8;
+    const pw = player.w - 14;
+    const ph = player.h - 10;
+
+    // Bananas
+    for (const b of bananas){
+        if (b.taken) continue;
+        const isMega = b.mega === true;
+        const halfBox = isMega ? 22 : 12;
+        const bx = b.x - halfBox, by = b.y - halfBox, bw = halfBox*2, bh = halfBox*2;
+        if (aabb(px, py, pw, ph, bx, by, bw, bh)){
+            b.taken = true;
+            b.anim = 0;
+            const value = isMega ? 5 : 1;
+            score += value;
+            if (isMega){
+                sfxCoin();
+                setTimeout(() => sfxCoin(), 80);
+                setTimeout(() => sfxCoin(), 160);
+            } else {
+                sfxCoin();
+            }
+            // Spawn fly-to-counter visual(s)
+            const count = isMega ? 5 : 1;
+            for (let i = 0; i < count; i++){
+                flyingBananas.push({
+                    x0: b.x - worldX,
+                    y0: b.y,
+                    x1: 28,
+                    y1: 32,
+                    t: -i * 0.05,        // stagger so mega-banana spawns 5 in sequence
+                    dur: 0.55,
+                    spin: Math.random() * 6,
+                    mega: false,         // flying icons are always small bananas
+                });
+            }
+            // Sparkle
+            const nSparks = isMega ? 16 : 6;
+            for (let i = 0; i < nSparks; i++){
+                particles.push({
+                    x: b.x, y: b.y,
+                    vx: (Math.random()-0.5) * (isMega ? 320 : 200),
+                    vy: (Math.random()-0.7) * (isMega ? 320 : 200),
+                    life: 0.4 + Math.random()*0.4,
+                    color: isMega ? '#fff080' : C.sparkY,
+                    size: 1.5 + Math.random()*2,
+                    grav: 0,
+                });
+            }
+        }
+    }
+
+    // Obstacles
+    for (const o of obstacles){
+        if (o.hit) continue;
+        let ox, oy, ow, oh;
+        if (o.type === 'BARREL'){
+            ox = o.x - 18; oy = o.y - 36; ow = 36; oh = 36;
+        } else {
+            // Enemy cart hitbox: matches its bigger visual now
+            ox = o.x - 36; oy = o.y - 50; ow = 72; oh = 50;
+        }
+        if (aabb(px, py, pw, ph, ox, oy, ow, oh)){
+            // Land on top of an oncoming cart → bounce off it.
+            if (o.type === 'CART_ENEMY' && player.vy > 0 && py + ph - 12 < oy){
+                player.vy = JUMP_VEL * 0.85;
+                o.hit = true;
+                sfxJump();
+                for (let i = 0; i < 8; i++){
+                    particles.push({
+                        x: o.x, y: oy,
+                        vx: (Math.random()-0.5)*220, vy: (Math.random()-0.7)*220,
+                        life: 0.4 + Math.random()*0.3,
+                        color: '#9a6030',
+                        size: 2 + Math.random()*2,
+                        grav: 600,
+                    });
+                }
+                continue;
+            }
+            o.hit = true;
+            gameOver(o.type === 'BARREL' ? 'hit-barrel' : 'hit-cart');
+        }
+    }
+}
+
+// ============================================================
+// RENDER
+// ============================================================
+let frame = 0;
+
+function render(){
+    frame++;
+    activeButtons.length = 0;
+    ctx.save();
+    if (shake > 0){
+        ctx.translate(
+            (Math.random()-0.5) * shake,
+            (Math.random()-0.5) * shake
+        );
+    }
+    drawSky();
+    drawCaveWallBG();
+    // All procedural silhouette layers (far / mid / near) removed — they used
+    // hardcoded y values that floated weirdly in portrait, and the cave-wall
+    // sprite already provides all the depth/atmosphere we need.
+    drawTrack();
+    drawBananas();
+    drawObstacles();
+    drawParticles();
+    drawPlayer();
+    drawExplosions();
+    ctx.restore();
+
+    drawHUD();
+    drawFlyingBananas();   // bananas en route to the counter, drawn over HUD
+
+    if (flashRed > 0){
+        ctx.fillStyle = `rgba(255,40,30,${flashRed * 0.45})`;
+        ctx.fillRect(0, 0, W, H);
+    }
+
+    if (state === STATE.MENU)  drawMenu();
+    if (state === STATE.DEAD)  drawGameOver();
+    drawVignette();
+}
+
+// --- BACKGROUND LAYERS ---
+function drawCaveWallBG(){
+    const spr = SPRITES.caveBG;
+    if (!spr) return;
+    // Tile horizontally with slow parallax. Sized to fill most of vertical space.
+    const drawH = H * 0.85;
+    const drawW = drawH * spr.width / spr.height;
+    const parallax = 0.12;
+    const scroll = ((worldX * parallax) % drawW + drawW) % drawW;
+    let x = -scroll;
+    const y = H * 0.05;
+    while (x < W){
+        ctx.drawImage(spr, x, y, drawW, drawH);
+        x += drawW;
+    }
+    // Slight tint overlay to push it back / unify with our palette
+    ctx.fillStyle = 'rgba(20, 8, 40, 0.35)';
+    ctx.fillRect(0, 0, W, H);
+}
+
+function drawSky(){
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, C.skyTop);
+    g.addColorStop(0.55, '#1a0e35');
+    g.addColorStop(1, C.skyBot);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // Distant glow
+    const rg = ctx.createRadialGradient(W*0.5, H*0.85, 50, W*0.5, H*0.85, 400);
+    rg.addColorStop(0, 'rgba(120,60,180,0.18)');
+    rg.addColorStop(1, 'rgba(120,60,180,0)');
+    ctx.fillStyle = rg;
+    ctx.fillRect(0, 0, W, H);
+}
+
+function drawFarBackground(){
+    // Slow parallax distant cave silhouettes
+    const scroll = (worldX * 0.05) % 600;
+    ctx.fillStyle = C.farCave;
+    for (let i = -1; i < 4; i++){
+        const ox = i * 600 - scroll;
+        // Big mountain-ish silhouettes
+        ctx.beginPath();
+        ctx.moveTo(ox, H);
+        ctx.lineTo(ox, 250);
+        ctx.lineTo(ox + 80, 180);
+        ctx.lineTo(ox + 160, 220);
+        ctx.lineTo(ox + 240, 160);
+        ctx.lineTo(ox + 340, 200);
+        ctx.lineTo(ox + 420, 170);
+        ctx.lineTo(ox + 500, 230);
+        ctx.lineTo(ox + 600, 200);
+        ctx.lineTo(ox + 600, H);
+        ctx.closePath();
+        ctx.fill();
+    }
+    // Stalactites top
+    const sScroll = (worldX * 0.05) % 80;
+    ctx.fillStyle = '#0a0420';
+    for (let x = -sScroll; x < W + 80; x += 80){
+        const h = 30 + ((Math.floor((x + worldX*0.05)/80) * 31) % 40);
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x + 25, 0);
+        ctx.lineTo(x + 12, h);
+        ctx.closePath();
+        ctx.fill();
+    }
+}
+
+function drawMidBackground(){
+    const scroll = (worldX * 0.18) % 480;
+    ctx.fillStyle = C.midCave;
+    for (let i = -1; i < 4; i++){
+        const ox = i * 480 - scroll;
+        ctx.beginPath();
+        ctx.moveTo(ox, H);
+        ctx.lineTo(ox, 290);
+        ctx.lineTo(ox + 60, 240);
+        ctx.lineTo(ox + 120, 270);
+        ctx.lineTo(ox + 180, 220);
+        ctx.lineTo(ox + 260, 250);
+        ctx.lineTo(ox + 340, 230);
+        ctx.lineTo(ox + 400, 270);
+        ctx.lineTo(ox + 480, 250);
+        ctx.lineTo(ox + 480, H);
+        ctx.closePath();
+        ctx.fill();
+    }
+    // Mid stalactites
+    const sScroll = (worldX * 0.18) % 120;
+    ctx.fillStyle = '#15082b';
+    for (let x = -sScroll; x < W + 120; x += 120){
+        const seedI = Math.floor((x + worldX*0.18)/120);
+        const h = 40 + ((seedI * 53) % 60);
+        const wd = 30 + ((seedI * 17) % 20);
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x + wd, 0);
+        ctx.lineTo(x + wd*0.5, h);
+        ctx.closePath();
+        ctx.fill();
+    }
+    // Wood support beams in distance
+    const bScroll = (worldX * 0.25) % 280;
+    ctx.fillStyle = '#1a0c20';
+    for (let x = -bScroll; x < W + 280; x += 280){
+        ctx.fillRect(x + 20, 200, 8, 200);
+        ctx.fillRect(x + 200, 220, 8, 180);
+        ctx.fillRect(x + 16, 200, 200, 5);
+    }
+}
+
+function drawNearBackground(){
+    const scroll = (worldX * 0.5) % 400;
+    // Foreground silhouettes (low-lying rocks, support struts)
+    ctx.fillStyle = '#080214';
+    for (let i = -1; i < 4; i++){
+        const ox = i * 400 - scroll;
+        ctx.beginPath();
+        ctx.moveTo(ox, H);
+        ctx.lineTo(ox, 380);
+        ctx.lineTo(ox + 80, 365);
+        ctx.lineTo(ox + 160, 380);
+        ctx.lineTo(ox + 240, 360);
+        ctx.lineTo(ox + 320, 380);
+        ctx.lineTo(ox + 400, 370);
+        ctx.lineTo(ox + 400, H);
+        ctx.closePath();
+        ctx.fill();
+    }
+}
+
+// --- TRACK ---
+// Draw a single rail layer (planks, ties, two rails, pillars going down to
+// pillarBottomY). yAt(wx) gives the surface y for any world x in [segX..segX+w].
+// Use pillarBottomY = H for normal rails, pillarBottomY = lowerRailTopY for
+// stacked-high rails (so supports run between the two tracks instead of all
+// the way down).
+function drawRailLayer(segX, segW, yAt, pillarBottomY){
+    const sx = segX - worldX;
+    // Pillars / supports
+    const pillarSpacing = 60;
+    const startP = Math.ceil(segX / pillarSpacing) * pillarSpacing;
+    for (let pwx = startP; pwx < segX + segW; pwx += pillarSpacing){
+        const px = pwx - worldX;
+        if (px < -20 || px > W + 20) continue;
+        const ty = yAt(pwx);
+        const colH = pillarBottomY - ty - 12;
+        if (colH > 0){
+            ctx.fillStyle = '#1a0c08';
+            ctx.fillRect(px - 4, ty + 12, 8, colH);
+            ctx.fillStyle = '#2d1610';
+            ctx.fillRect(px - 3, ty + 12, 2, colH);
+        }
+        // Diagonal braces only when there's room (not for short stacked supports)
+        if (colH > 40){
+            ctx.strokeStyle = '#150806';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(px, ty + 30);
+            ctx.lineTo(px + 22, ty + 60);
+            ctx.moveTo(px, ty + 30);
+            ctx.lineTo(px - 22, ty + 60);
+            ctx.stroke();
+        }
+    }
+
+    const x0 = Math.max(-10, sx);
+    const x1 = Math.min(W + 10, sx + segW);
+    const yL_clip = yAt(x0 + worldX);
+    const yR_clip = yAt(x1 + worldX);
+
+    // Plank body (polygon to support slopes)
+    ctx.fillStyle = C.plank;
+    ctx.beginPath();
+    ctx.moveTo(x0, yL_clip); ctx.lineTo(x1, yR_clip);
+    ctx.lineTo(x1, yR_clip + 18); ctx.lineTo(x0, yL_clip + 18);
+    ctx.closePath(); ctx.fill();
+
+    // Top highlight strip
+    ctx.fillStyle = C.plankLight;
+    ctx.beginPath();
+    ctx.moveTo(x0, yL_clip); ctx.lineTo(x1, yR_clip);
+    ctx.lineTo(x1, yR_clip + 2); ctx.lineTo(x0, yL_clip + 2);
+    ctx.closePath(); ctx.fill();
+
+    // Bottom shadow strip
+    ctx.fillStyle = C.plankDark;
+    ctx.beginPath();
+    ctx.moveTo(x0, yL_clip + 16); ctx.lineTo(x1, yR_clip + 16);
+    ctx.lineTo(x1, yR_clip + 18); ctx.lineTo(x0, yL_clip + 18);
+    ctx.closePath(); ctx.fill();
+
+    // Vertical wood grain
+    ctx.strokeStyle = C.plankDark;
+    ctx.lineWidth = 1;
+    const grainStart = Math.floor(segX / 20) * 20;
+    for (let gx = grainStart; gx < segX + segW; gx += 20){
+        const sxg = gx - worldX;
+        if (sxg < x0 - 1 || sxg > x1 + 1) continue;
+        const gy = yAt(gx);
+        ctx.beginPath();
+        ctx.moveTo(sxg, gy + 3);
+        ctx.lineTo(sxg, gy + 15);
+        ctx.stroke();
+    }
+
+    // Cross ties (poke up above the plank)
+    const tieSpacing = 28;
+    const tStart = Math.floor(segX / tieSpacing) * tieSpacing;
+    for (let tx = tStart; tx < segX + segW; tx += tieSpacing){
+        const stx = tx - worldX;
+        if (stx < -16 || stx > W + 16) continue;
+        const ty = yAt(tx);
+        ctx.fillStyle = C.plankDark;
+        ctx.fillRect(stx - 6, ty - 4, 12, 6);
+        ctx.fillStyle = C.plank;
+        ctx.fillRect(stx - 5, ty - 4, 10, 2);
+    }
+
+    // Two parallel rails on top
+    const drawRail = (offY, h, color) => {
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(x0, yL_clip + offY); ctx.lineTo(x1, yR_clip + offY);
+        ctx.lineTo(x1, yR_clip + offY + h); ctx.lineTo(x0, yL_clip + offY + h);
+        ctx.closePath(); ctx.fill();
+    };
+    drawRail(-6, 3, C.railDark);
+    drawRail(-1, 3, C.railDark);
+    drawRail(-5, 1, C.rail);
+    drawRail(0, 1, C.rail);
+}
+
+function drawTrack(){
+    for (const s of segments){
+        const sx = s.x - worldX;
+        if (sx + s.w < -50 || sx > W + 50) continue;
+        if (s.type === 'GAP') continue;
+
+        if (s.type === 'STACKED'){
+            // LOW rail with pillars all the way to the screen bottom
+            drawRailLayer(s.x, s.w, () => s.yLow, H);
+            // HIGH rail (may be sloped) with short supports to the low rail
+            drawRailLayer(s.x, s.w, (wx) => highY(s, wx), s.yLow - 4);
+            continue;
+        }
+
+        const yAt = (wx) => surfaceY(s, wx);
+        drawRailLayer(s.x, s.w, yAt, H);
+    }
+
+    // Abyss glow under all gaps
+    for (const s of segments){
+        if (s.type !== 'GAP') continue;
+        const sx = s.x - worldX;
+        if (sx + s.w < 0 || sx > W) continue;
+        const x0 = Math.max(0, sx);
+        const x1 = Math.min(W, sx + s.w);
+        const idx = segments.indexOf(s);
+        const prev = segments[idx - 1];
+        const next = segments[idx + 1];
+        const prevY = prev ? endY(prev) : TIER_DEFAULT;
+        let nextY = TIER_DEFAULT;
+        if (next){
+            if (next.type === 'TRACK') nextY = next.y;
+            else if (next.type === 'SLOPE') nextY = next.y1;
+            else if (next.type === 'STACKED') nextY = next.yLow;
+        }
+        const topY = Math.max(prevY, nextY);
+        const grad = ctx.createLinearGradient(0, topY, 0, H);
+        grad.addColorStop(0, 'rgba(0,0,0,0)');
+        grad.addColorStop(0.4, 'rgba(80,30,120,0.05)');
+        grad.addColorStop(1, 'rgba(120,40,160,0.20)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(x0, topY, x1 - x0, H - topY);
+    }
+}
+
+// --- BANANAS ---
+function drawBananas(){
+    for (const b of bananas){
+        if (b.taken) continue;  // taken bananas now fly to the HUD instead
+        const sx = b.x - worldX;
+        if (sx < -40 || sx > W + 40) continue;
+        const bob = Math.sin(b.anim) * 4;
+        const rot = Math.sin(b.anim * 0.7) * 0.2;
+        if (b.mega){
+            drawMegaBanana(sx, b.y + bob, rot);
+        } else {
+            drawBanana(sx, b.y + bob, 1, rot);
+        }
+    }
+}
+
+function drawMegaBanana(x, y, rot){
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    const spr = SPRITES.megabanana;
+    if (spr){
+        const w = 56, h = w * spr.height / spr.width;
+        // Pulsing glow behind
+        const pulse = 0.5 + Math.sin(frame * 0.18) * 0.5;
+        ctx.fillStyle = `rgba(255, 240, 120, ${0.18 + pulse * 0.12})`;
+        ctx.beginPath(); ctx.arc(0, 0, 30 + pulse * 4, 0, Math.PI * 2); ctx.fill();
+        ctx.drawImage(spr, -w/2, -h/2, w, h);
+    } else {
+        // Fallback: enlarged regular banana
+        ctx.scale(2.2, 2.2);
+        ctx.fillStyle = '#d4a020';
+        ctx.beginPath();
+        ctx.ellipse(0, 0, 10, 5, Math.PI / 5, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.restore();
+}
+
+function drawExplosions(){
+    const spr = SPRITES.explosion;
+    for (const e of explosions){
+        const tt = e.t / e.dur;
+        const sx = e.x - worldX;
+        // Scale: punch out fast, hold, fade
+        const sc = (e.scale || 1.4) * (tt < 0.2 ? tt / 0.2 * 1.2 : (tt < 0.7 ? 1.2 - (tt - 0.2) * 0.4 : 1.0));
+        const alpha = tt < 0.7 ? 1 : 1 - (tt - 0.7) / 0.3;
+        const rot = tt * 0.6;  // gentle rotation
+        if (spr){
+            const w = 140 * sc, h = 140 * sc * spr.height / spr.width;
+            ctx.save();
+            ctx.globalAlpha = Math.max(0, alpha);
+            ctx.translate(sx, e.y);
+            ctx.rotate(rot);
+            ctx.drawImage(spr, -w/2, -h/2, w, h);
+            ctx.restore();
+        } else {
+            // Fallback: bright orange burst
+            ctx.fillStyle = `rgba(255, 180, 50, ${alpha * 0.8})`;
+            ctx.beginPath();
+            ctx.arc(sx, e.y, 60 * sc, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+}
+
+// Bananas in flight to the HUD counter (drawn after HUD so they overlay)
+function drawFlyingBananas(){
+    for (const f of flyingBananas){
+        const tt = Math.max(0, f.t) / f.dur;
+        const ease = 1 - (1 - tt) * (1 - tt);  // ease-out
+        const x = f.x0 + (f.x1 - f.x0) * ease;
+        const baseY = f.y0 + (f.y1 - f.y0) * ease;
+        const arc = -Math.sin(tt * Math.PI) * 90;  // upward bow
+        drawBanana(x, baseY + arc, 1, f.spin);
+    }
+}
+
+function drawBanana(x, y, alpha, rot){
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    ctx.globalAlpha = alpha;
+    const spr = SPRITES.banana;
+    if (spr){
+        // Banana sprite is wider than tall; aim for ~28px wide on screen
+        const w = 32, h = w * spr.height / spr.width;
+        ctx.drawImage(spr, -w/2, -h/2, w, h);
+    } else {
+        // Fallback: primitive
+        ctx.fillStyle = C.bananaDk;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, 10, 5, Math.PI / 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = C.banana;
+        ctx.lineWidth = 5;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(-9, 4);
+        ctx.quadraticCurveTo(-3, -7, 9, -3);
+        ctx.stroke();
+    }
+    ctx.restore();
+}
+
+// --- OBSTACLES ---
+function drawObstacles(){
+    for (const o of obstacles){
+        const sx = o.x - worldX;
+        if (sx < -100 || sx > W + 100) continue;
+        if (o.type === 'BARREL'){
+            drawBarrel(sx, o.y);
+        } else if (o.type === 'CART_ENEMY'){
+            drawEnemyCartSprite(sx, o.y);
+        }
+    }
+}
+
+function drawSpriteWheel(x, y, dia, rot){
+    const spr = SPRITES.wheel;
+    if (!spr) return;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    ctx.drawImage(spr, -dia/2, -dia/2, dia, dia);
+    ctx.restore();
+}
+
+function drawEnemyCartSprite(x, y){
+    ctx.save();
+    ctx.translate(x, y);
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 28 * SPRITE_SCALE, 4, 0, 0, Math.PI*2);
+    ctx.fill();
+    const spr = SPRITES.enemy;
+    if (spr){
+        // Enemy sprite is taller (includes reptile on top). Bump h so the
+        // CART portion visually matches the player's cart size.
+        const h = 90 * SPRITE_SCALE;
+        const w = h * spr.width / spr.height;
+        const wob = Math.sin(frame * 0.4) * 0.5;
+        const top = -h + 6 + wob;
+        ctx.drawImage(spr, -w/2, top, w, h);
+        if (SPRITES.wheel){
+            const wDia = w * 0.34;
+            const wYOff = top + h * 0.801;
+            const wXOff = w * 0.286;
+            const wRot = -worldX / (wDia * 0.5) * 1.3;
+            drawSpriteWheel(-wXOff, wYOff, wDia, wRot);
+            drawSpriteWheel( wXOff, wYOff, wDia, wRot);
+        }
+    } else {
+        drawEnemyCart(0, 0, false, frame);
+    }
+    ctx.restore();
+}
+
+function drawBarrel(x, y){
+    ctx.save();
+    ctx.translate(x, y);
+    // Shadow under
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 18 * SPRITE_SCALE, 4, 0, 0, Math.PI*2);
+    ctx.fill();
+    const spr = SPRITES.barrel;
+    if (spr){
+        const h = 44 * SPRITE_SCALE;
+        const w = h * spr.width / spr.height;
+        ctx.drawImage(spr, -w/2, -h, w, h);
+    } else {
+        // Fallback primitive
+        ctx.fillStyle = '#a04020';
+        ctx.fillRect(-15, -36, 30, 36);
+        ctx.fillStyle = '#2a2a2a';
+        ctx.fillRect(-15, -28, 30, 3);
+        ctx.fillRect(-15, -10, 30, 3);
+    }
+    ctx.restore();
+}
+
+function drawEnemyCart(x, y, facingRight, fr){
+    ctx.save();
+    ctx.translate(x, y);
+    const dir = facingRight ? 1 : -1;
+    ctx.scale(dir, 1);
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 28, 4, 0, 0, Math.PI*2);
+    ctx.fill();
+    // Body
+    ctx.fillStyle = '#3a1c08';
+    ctx.beginPath();
+    ctx.moveTo(-26, -28);
+    ctx.lineTo(26, -28);
+    ctx.lineTo(22, -2);
+    ctx.lineTo(-22, -2);
+    ctx.closePath();
+    ctx.fill();
+    // Plank highlights
+    ctx.strokeStyle = '#5a2c10';
+    ctx.lineWidth = 1;
+    for (let i = -22; i <= 22; i += 6){
+        ctx.beginPath();
+        ctx.moveTo(i, -27);
+        ctx.lineTo(i - 1, -3);
+        ctx.stroke();
+    }
+    // Iron rim
+    ctx.strokeStyle = '#0a0a0a';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(-26, -28);
+    ctx.lineTo(26, -28);
+    ctx.stroke();
+    // Kremling-ish enemy peeking out
+    ctx.fillStyle = '#3a6010';
+    ctx.beginPath();
+    ctx.ellipse(0, -34, 10, 7, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.fillStyle = '#5a8020';
+    ctx.beginPath();
+    ctx.ellipse(0, -36, 8, 5, 0, 0, Math.PI*2);
+    ctx.fill();
+    // Eyes
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(2, -38, 3, 3);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(3, -37, 1.5, 1.5);
+    // Wheels
+    const wr = (fr * 0.4) * dir;
+    drawWheel(-15, -8, 8, wr);
+    drawWheel(15, -8, 8, wr);
+    ctx.restore();
+}
+
+// --- PLAYER ---
+function drawPlayer(){
+    const x = PLAYER_X;
+    const y = player.y;
+    const inAir = !player.onGround;
+
+    // === DEAD: launch the ape into the air, spinning, with shocked pose ===
+    if (state === STATE.DEAD && SPRITES.apeLose){
+        const t = player.deadFrame;
+        const spr = SPRITES.apeLose;
+        // Pop up, spin, then ride the falling player physics already in update()
+        const liftY = (t < 0.5) ? -t * 360 : -180 + (t - 0.5) * 200;
+        const spin = t * 6;
+        const sc = 1.2;
+        const aH = 70 * sc;
+        const aW = aH * spr.width / spr.height;
+        ctx.save();
+        ctx.translate(x + 32, y + 25 + liftY);
+        ctx.rotate(spin);
+        ctx.drawImage(spr, -aW/2, -aH/2, aW, aH);
+        ctx.restore();
+        return;
+    }
+    const bob = inAir ? 0 : Math.sin(frame * 0.4) * 0.7;
+
+    // Tilt: in-air = lean from vy; grounded on slope = match slope angle
+    let tilt;
+    if (inAir){
+        tilt = Math.max(-0.25, Math.min(0.25, player.vy / 1500));
+    } else {
+        // Sample ground ahead/behind, preferring the rail we're currently on
+        const cx = worldX + PLAYER_X + player.w * 0.5;
+        const ya = groundAt(cx + 18, player.groundY);
+        const yb = groundAt(cx - 18, player.groundY);
+        if (ya !== null && yb !== null){
+            tilt = Math.atan2(ya - yb, 36) * 0.85;
+        } else {
+            tilt = 0;
+        }
+    }
+
+    ctx.save();
+    ctx.translate(x + 32, y + 25 + bob);
+    ctx.rotate(tilt);
+
+    // Cart shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.ellipse(0, 30, 32, 5, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    if (SPRITES.ape && SPRITES.cart){
+        const cartH = 50 * SPRITE_SCALE;
+        const cartW = cartH * SPRITES.cart.width / SPRITES.cart.height;
+        const apeH = 48 * SPRITE_SCALE;
+        const apeW = apeH * SPRITES.ape.width / SPRITES.ape.height;
+
+        // === Ape animation ===
+        // Independent bob (faster than cart bob) to look like he's bouncing IN the cart
+        const apeBob = Math.sin(frame * 0.55) * 1.3;
+        // Speed-driven rattle when grounded — subtle, only kicks in at higher speeds
+        const speedNorm = Math.min(1, (speed - INIT_SPEED) / (MAX_SPEED - INIT_SPEED));
+        const rattle = (player.onGround ? Math.max(0, speedNorm - 0.3) : 0) * 0.4;
+        const rx = (Math.random() - 0.5) * rattle;
+        const ry = (Math.random() - 0.5) * rattle;
+        // Squash/stretch: squashed on landing, stretched on takeoff (negative vy)
+        let sqX = 1, sqY = 1;
+        if (player.squash > 0){
+            sqY = 1 - player.squash * 0.18;
+            sqX = 1 + player.squash * 0.10;
+        } else if (!player.onGround && player.vy < -200){
+            // Stretch upward during ascent
+            const s = Math.min(1, -player.vy / 800);
+            sqY = 1 + s * 0.10;
+            sqX = 1 - s * 0.05;
+        }
+        // Excited lean when in air (after a brief moment)
+        const airLean = !player.onGround && player.airTime > 0.05
+            ? Math.max(-0.18, Math.min(0.10, -player.vy / 5000))
+            : 0;
+
+        // Cart wheel center fixed at y=+19 from player center (slightly below rail).
+        // Cart top = wheelY - cartH * 0.727 (sprite has wheels at 72.7% from top).
+        const wheelY = 19;
+        const cartTop = wheelY - cartH * 0.727;
+        // Ape sits IN the cart — ratio kept from original layout.
+        const apeBottom = cartTop + cartH * 0.46;
+        const apeTop = apeBottom - apeH;
+
+        ctx.save();
+        ctx.translate(rx, apeBob + ry);
+        ctx.rotate(airLean);
+        ctx.scale(sqX, sqY);
+        ctx.drawImage(SPRITES.ape, -apeW/2, apeTop, apeW, apeH);
+        ctx.restore();
+
+        // Cart on top (no rattle, no squash — it's the heavier object)
+        const cartBobExtra = Math.sin(frame * 0.4) * 0.4;
+        ctx.drawImage(SPRITES.cart, -cartW/2, cartTop + cartBobExtra, cartW, cartH);
+
+        // Rotating wheels in the empty wheel wells
+        if (SPRITES.wheel){
+            const wDia = cartW * 0.27;
+            const wYOff = wheelY + cartBobExtra;
+            const wXOff = cartW * 0.221;
+            const wRot = worldX / (wDia * 0.5);
+            drawSpriteWheel(-wXOff, wYOff, wDia, wRot);
+            drawSpriteWheel( wXOff, wYOff, wDia, wRot);
+        }
+    } else {
+        // Fallback primitives
+        drawApe(0, -8, frame, inAir);
+        drawCart(0, 5, frame);
+    }
+
+    ctx.restore();
+}
+
+function drawApe(cx, cy, fr, inAir){
+    const wave = Math.sin(fr * 0.4) * 1.2;
+    // Body
+    ctx.fillStyle = C.apeFur;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy + 6, 18, 14, 0, 0, Math.PI*2);
+    ctx.fill();
+    // Belly fur lighter
+    ctx.fillStyle = C.apeFace;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy + 9, 10, 7, 0, 0, Math.PI*2);
+    ctx.fill();
+    // Tie
+    ctx.fillStyle = C.tieRed;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + 5);
+    ctx.lineTo(cx - 5, cy + 16);
+    ctx.lineTo(cx, cy + 19);
+    ctx.lineTo(cx + 5, cy + 16);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = C.tieRedDk;
+    ctx.fillRect(cx - 4, cy + 4, 8, 3);
+    // Arms holding cart
+    ctx.fillStyle = C.apeFur;
+    ctx.beginPath();
+    ctx.ellipse(cx - 16, cy + 8 + wave*0.5, 6, 5, 0.3, 0, Math.PI*2);
+    ctx.ellipse(cx + 16, cy + 8 - wave*0.5, 6, 5, -0.3, 0, Math.PI*2);
+    ctx.fill();
+
+    // Head
+    ctx.fillStyle = C.apeFur;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy - 8, 14, 13, 0, 0, Math.PI*2);
+    ctx.fill();
+    // Hair top
+    ctx.fillStyle = '#2a1408';
+    ctx.beginPath();
+    ctx.ellipse(cx, cy - 16, 11, 4, 0, 0, Math.PI*2);
+    ctx.fill();
+    // Face
+    ctx.fillStyle = C.apeFace;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy - 5, 9, 8, 0, 0, Math.PI*2);
+    ctx.fill();
+    // Brow
+    ctx.fillStyle = '#3a1808';
+    ctx.beginPath();
+    ctx.ellipse(cx - 4, cy - 10, 4, 2, -0.2, 0, Math.PI*2);
+    ctx.ellipse(cx + 4, cy - 10, 4, 2, 0.2, 0, Math.PI*2);
+    ctx.fill();
+    // Eyes
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(cx - 4, cy - 7, 2.4, 0, Math.PI*2);
+    ctx.arc(cx + 4, cy - 7, 2.4, 0, Math.PI*2);
+    ctx.fill();
+    ctx.fillStyle = '#000';
+    const eyeShift = inAir ? 0.6 : 0;
+    ctx.beginPath();
+    ctx.arc(cx - 3.5 + eyeShift, cy - 7, 1.4, 0, Math.PI*2);
+    ctx.arc(cx + 4.5 + eyeShift, cy - 7, 1.4, 0, Math.PI*2);
+    ctx.fill();
+    // Nostrils
+    ctx.fillStyle = '#3a1808';
+    ctx.fillRect(cx - 2, cy - 3, 1.5, 2);
+    ctx.fillRect(cx + 0.5, cy - 3, 1.5, 2);
+    // Mouth (smile when grounded, "o" when in air)
+    ctx.strokeStyle = '#3a1808';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    if (inAir){
+        ctx.arc(cx, cy + 1, 1.8, 0, Math.PI*2);
+    } else {
+        ctx.arc(cx, cy + 1, 3, 0.1 * Math.PI, 0.9 * Math.PI);
+    }
+    ctx.stroke();
+}
+
+function drawCart(cx, cy, fr){
+    // Body bucket-shape
+    // Bottom dark
+    ctx.fillStyle = C.cartDark;
+    ctx.beginPath();
+    ctx.moveTo(cx - 30, cy + 6);
+    ctx.lineTo(cx + 30, cy + 6);
+    ctx.lineTo(cx + 26, cy + 18);
+    ctx.lineTo(cx - 26, cy + 18);
+    ctx.closePath();
+    ctx.fill();
+    // Main wood
+    ctx.fillStyle = C.cartWood;
+    ctx.beginPath();
+    ctx.moveTo(cx - 32, cy - 10);
+    ctx.lineTo(cx + 32, cy - 10);
+    ctx.lineTo(cx + 30, cy + 6);
+    ctx.lineTo(cx - 30, cy + 6);
+    ctx.closePath();
+    ctx.fill();
+    // Plank lines
+    ctx.strokeStyle = C.cartDark;
+    ctx.lineWidth = 1;
+    for (let i = -3; i <= 3; i++){
+        const px = cx + i * 9;
+        ctx.beginPath();
+        ctx.moveTo(px, cy - 10);
+        ctx.lineTo(px - 0.4, cy + 6);
+        ctx.stroke();
+    }
+    // Iron bands
+    ctx.fillStyle = C.cartIron;
+    ctx.fillRect(cx - 32, cy - 10, 64, 3);
+    ctx.fillRect(cx - 30, cy + 5, 60, 3);
+    // Rivets
+    for (let i = -2; i <= 2; i++){
+        ctx.fillStyle = '#0a0a0a';
+        ctx.beginPath();
+        ctx.arc(cx + i * 12, cy - 8.5, 1.5, 0, Math.PI*2);
+        ctx.arc(cx + i * 12, cy + 6.5, 1.4, 0, Math.PI*2);
+        ctx.fill();
+    }
+    // Front lip highlight
+    ctx.fillStyle = '#8a4a20';
+    ctx.fillRect(cx - 32, cy - 10, 64, 1);
+    // Wheels (slightly tucked, sit on the rails)
+    const wr = (fr * 0.5);
+    drawWheel(cx - 18, cy + 10, 9, wr);
+    drawWheel(cx + 18, cy + 10, 9, wr);
+}
+
+function drawWheel(cx, cy, r, rot){
+    // Outer black
+    ctx.fillStyle = C.cartIron;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI*2);
+    ctx.fill();
+    // Inner ring
+    ctx.fillStyle = '#3a3a3a';
+    ctx.beginPath();
+    ctx.arc(cx, cy, r - 2.5, 0, Math.PI*2);
+    ctx.fill();
+    // Spokes
+    ctx.strokeStyle = C.cartIron;
+    ctx.lineWidth = 2.4;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(rot);
+    for (let i = 0; i < 4; i++){
+        ctx.rotate(Math.PI / 2);
+        ctx.beginPath();
+        ctx.moveTo(-r + 2, 0);
+        ctx.lineTo(r - 2, 0);
+        ctx.stroke();
+    }
+    ctx.restore();
+    // Hub
+    ctx.fillStyle = C.cartIron;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 3, 0, Math.PI*2);
+    ctx.fill();
+    // Highlight
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.beginPath();
+    ctx.arc(cx - r*0.4, cy - r*0.4, 1.5, 0, Math.PI*2);
+    ctx.fill();
+}
+
+// --- PARTICLES ---
+function drawParticles(){
+    for (const p of particles){
+        if (p.life <= 0) continue;
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = Math.max(0, Math.min(1, p.life * 2));
+        ctx.beginPath();
+        ctx.arc(p.x - worldX * 0, p.y, p.size, 0, Math.PI*2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+    }
+}
+
+// --- HUD ---
+function drawHUD(){
+    const k = HUD_SCALE;
+    ctx.font = `bold ${Math.round(22 * k)}px "Courier New", monospace`;
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'left';
+
+    // Banana icon + count — pulses when a flying banana arrives
+    const iconScale = (1 + hudPulse * 0.45) * k;
+    ctx.save();
+    ctx.translate(28 * k, 32 * k);
+    ctx.scale(iconScale, iconScale);
+    drawBanana(0, 0, 1, -0.4);
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(50 * k, 22 * k);
+    const txtScale = (1 + hudPulse * 0.25);
+    ctx.scale(txtScale, txtScale);
+    drawText(`x ${score}`, 0, 0, '#ffe070', '#3a2008');
+    ctx.restore();
+
+    // Distance right
+    ctx.textAlign = 'right';
+    drawText(`${distance} m`, W - 20 * k, 22 * k, C.text, C.textShad);
+
+    ctx.textAlign = 'left';
+}
+
+function drawText(s, x, y, color, shadow){
+    if (shadow){
+        ctx.fillStyle = shadow;
+        ctx.fillText(s, x + 2, y + 2);
+    }
+    ctx.fillStyle = color;
+    ctx.fillText(s, x, y);
+}
+
+// ============================================================
+// UI: BUTTONS / TEXT FITTING
+// ============================================================
+let activeButtons = [];   // re-populated each frame on menu / game-over
+
+function fitTextSize(text, maxWidth, idealSize, weight = 'bold'){
+    let size = idealSize;
+    ctx.font = `${weight} ${size}px "Courier New", monospace`;
+    const w = ctx.measureText(text).width;
+    if (w > maxWidth) size = Math.floor(size * maxWidth / w);
+    return size;
+}
+
+function roundedRect(x, y, w, h, r){
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+}
+
+function drawButton(opts){
+    const { x, y, w, h, label, primary = false, pulse = false, onTap } = opts;
+    const t = pulse ? 0.5 + 0.5 * Math.sin(frame * 0.08) : 1;
+    const lift = pulse ? Math.sin(frame * 0.06) * 1.5 : 0;
+    const yy = y + lift;
+
+    // Color bands — chunky pixel art, no smooth gradients
+    let lightCol, midCol, darkCol, edgeCol, textCol, shadowCol;
+    if (primary){
+        lightCol = '#ffd870';
+        midCol   = '#e08820';
+        darkCol  = '#a04810';
+        edgeCol  = '#3a1408';
+        textCol  = '#ffffff';
+        shadowCol = '#5a1808';
+    } else {
+        lightCol = '#6a4220';
+        midCol   = '#3a2010';
+        darkCol  = '#1a0c04';
+        edgeCol  = '#000000';
+        textCol  = '#f0c878';
+        shadowCol = '#1a0c04';
+    }
+
+    // Hard rectangular drop shadow (offset 4px, no blur)
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(x + 4, yy + 5, w, h);
+
+    // Three solid color bands stacked: top 35%, mid 35%, bottom 30%
+    const band1 = Math.round(h * 0.35);
+    const band2 = Math.round(h * 0.35);
+    ctx.fillStyle = lightCol;
+    ctx.fillRect(x, yy, w, band1);
+    ctx.fillStyle = midCol;
+    ctx.fillRect(x, yy + band1, w, band2);
+    ctx.fillStyle = darkCol;
+    ctx.fillRect(x, yy + band1 + band2, w, h - band1 - band2);
+
+    // Hard-edge border (2px), with a 1px inner highlight on top-left
+    ctx.fillStyle = edgeCol;
+    ctx.fillRect(x, yy, w, 2);                  // top
+    ctx.fillRect(x, yy + h - 2, w, 2);          // bottom
+    ctx.fillRect(x, yy, 2, h);                  // left
+    ctx.fillRect(x + w - 2, yy, 2, h);          // right
+    // 1px inner highlight strips (top + left)
+    ctx.fillStyle = primary ? 'rgba(255,255,255,0.5)' : 'rgba(255,220,150,0.25)';
+    ctx.fillRect(x + 2, yy + 2, w - 4, 1);
+    ctx.fillRect(x + 2, yy + 2, 1, h - 4);
+    // 1px inner shadow (bottom + right)
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(x + 2, yy + h - 3, w - 4, 1);
+    ctx.fillRect(x + w - 3, yy + 2, 1, h - 4);
+
+    // Pulsing pixel "corner brackets" instead of smooth glow
+    if (pulse){
+        const a = 0.35 + 0.45 * t;
+        ctx.fillStyle = `rgba(255, 220, 80, ${a})`;
+        const bs = 6, bw = 16;  // bracket size
+        // Top-left
+        ctx.fillRect(x - bs, yy - bs, bw, 2);
+        ctx.fillRect(x - bs, yy - bs, 2, bw);
+        // Top-right
+        ctx.fillRect(x + w - bw + bs, yy - bs, bw, 2);
+        ctx.fillRect(x + w + bs - 2, yy - bs, 2, bw);
+        // Bottom-left
+        ctx.fillRect(x - bs, yy + h + bs - 2, bw, 2);
+        ctx.fillRect(x - bs, yy + h - bw + bs, 2, bw);
+        // Bottom-right
+        ctx.fillRect(x + w - bw + bs, yy + h + bs - 2, bw, 2);
+        ctx.fillRect(x + w + bs - 2, yy + h - bw + bs, 2, bw);
+    }
+
+    // Label — pixel-style with hard offset shadow
+    const labelSize = Math.round(h * 0.42);
+    ctx.font = `bold ${labelSize}px "Courier New", monospace`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = shadowCol;
+    ctx.fillText(label, x + w/2 + 2, yy + h/2 + 2);
+    ctx.fillStyle = textCol;
+    ctx.fillText(label, x + w/2, yy + h/2);
+
+    activeButtons.push({ x, y, w, h, onTap });
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+}
+
+// Pixel-style framed panel (hard edges, no rounded corners, double border)
+function drawPixelPanel(x, y, w, h){
+    // Drop shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(x + 4, y + 5, w, h);
+    // Body
+    ctx.fillStyle = '#2a1408';
+    ctx.fillRect(x, y, w, h);
+    // Outer border
+    ctx.fillStyle = '#000';
+    ctx.fillRect(x, y, w, 2);
+    ctx.fillRect(x, y + h - 2, w, 2);
+    ctx.fillRect(x, y, 2, h);
+    ctx.fillRect(x + w - 2, y, 2, h);
+    // Inner border (1px gold inset)
+    ctx.fillStyle = '#5a3818';
+    ctx.fillRect(x + 4, y + 4, w - 8, 1);
+    ctx.fillRect(x + 4, y + h - 5, w - 8, 1);
+    ctx.fillRect(x + 4, y + 4, 1, h - 8);
+    ctx.fillRect(x + w - 5, y + 4, 1, h - 8);
+}
+
+// Convert a pointer event to canvas-internal coordinates.
+function eventToCanvas(e){
+    const rect = canvas.getBoundingClientRect();
+    const t = e.touches && e.touches.length ? e.touches[0]
+            : (e.changedTouches && e.changedTouches.length ? e.changedTouches[0] : e);
+    const x = (t.clientX - rect.left) * W / rect.width;
+    const y = (t.clientY - rect.top)  * H / rect.height;
+    return { x, y };
+}
+
+function tryHitButton(cx, cy){
+    for (let i = activeButtons.length - 1; i >= 0; i--){
+        const b = activeButtons[i];
+        if (cx >= b.x && cx <= b.x + b.w && cy >= b.y && cy <= b.y + b.h){
+            b.onTap();
+            return true;
+        }
+    }
+    return false;
+}
+
+// --- VIGNETTE ---
+function drawVignette(){
+    const g = ctx.createRadialGradient(W/2, H/2, H*0.4, W/2, H/2, H*0.85);
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    g.addColorStop(1, 'rgba(0,0,0,0.55)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+}
+
+// --- MENU ---
+function drawMenu(){
+    // Dim BG more aggressively so the gameplay world doesn't fight the UI
+    ctx.fillStyle = 'rgba(8,4,20,0.78)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+
+    const isLandscape = W > H;
+
+    // === TITLE: use the pre-rendered logo sprite if loaded ===
+    const titleSpr = SPRITES.title;
+    const titleY = H * (isLandscape ? 0.08 : 0.07);
+    let titleH;
+    if (titleSpr){
+        const maxW = W * 0.85;
+        const maxH = H * (isLandscape ? 0.40 : 0.30);
+        let drawW = maxW;
+        let drawH = drawW * titleSpr.height / titleSpr.width;
+        if (drawH > maxH){
+            drawH = maxH;
+            drawW = drawH * titleSpr.width / titleSpr.height;
+        }
+        ctx.drawImage(titleSpr, W/2 - drawW/2, titleY, drawW, drawH);
+        titleH = drawH;
+    } else {
+        // Fallback: pixel-text title
+        const lines = isLandscape ? ['MINE CART CARNAGE'] : ['MINE CART', 'CARNAGE'];
+        const longest = lines.reduce((a, b) => a.length > b.length ? a : b);
+        const cap = isLandscape ? Math.min(W * 0.07, H * 0.18, 72)
+                                : Math.min(W * 0.15, H * 0.10, 84);
+        const titleSize = fitTextSize(longest, W - 40, cap);
+        ctx.font = `bold ${titleSize}px "Courier New", monospace`;
+        const lineGap = titleSize * 1.05;
+        ctx.lineWidth = Math.max(4, titleSize * 0.10);
+        ctx.strokeStyle = '#1a0418';
+        lines.forEach((l, i) => ctx.strokeText(l, W/2, titleY + i * lineGap));
+        const tg = ctx.createLinearGradient(0, titleY, 0, titleY + lineGap * lines.length);
+        tg.addColorStop(0, '#ffe080'); tg.addColorStop(0.55, '#d07820'); tg.addColorStop(1, '#7a3010');
+        ctx.fillStyle = tg;
+        lines.forEach((l, i) => ctx.fillText(l, W/2, titleY + i * lineGap));
+        titleH = lineGap * lines.length;
+    }
+
+    // (subtitle removed — title speaks for itself)
+
+    // === PLAY BUTTON ===
+    const btnW = Math.min(W * (isLandscape ? 0.40 : 0.75), 360);
+    const btnH = Math.min(H * (isLandscape ? 0.13 : 0.09), 78);
+    const btnY = isLandscape ? H * 0.66 : H * 0.62;
+    drawButton({
+        x: W/2 - btnW/2, y: btnY, w: btnW, h: btnH,
+        label: '▶  JUGAR',
+        primary: true, pulse: true,
+        onTap: startGame,
+    });
+
+    // Hint text under button
+    const hintSize = Math.max(11, Math.round(btnH * 0.22));
+    ctx.font = `${hintSize}px "Courier New", monospace`;
+    drawText('Tocá la pantalla para saltar', W/2, btnY + btnH + 12, '#a07050', '#000');
+
+    // === BEST SCORE PANEL (16-bit framed) ===
+    if (bestDist > 0 || bestBan > 0){
+        const recSize = Math.max(14, Math.round(btnH * 0.28));
+        const lineH = recSize * 1.15;
+        const padY = recSize * 0.55;
+        const badgeH = padY * 2 + lineH * 2;
+        const badgeW = Math.min(W * 0.85, 380);
+        const badgeY = H - badgeH - H * 0.06;
+        const badgeX = W/2 - badgeW/2;
+        drawPixelPanel(badgeX, badgeY, badgeW, badgeH);
+        // drawButton above reset textAlign to 'left' — re-center for the badge
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.font = `bold ${recSize}px "Courier New", monospace`;
+        drawText('★ MEJOR RÉCORD ★', W/2, badgeY + padY, '#ffd070', '#3a1808');
+        ctx.font = `${Math.round(recSize * 0.88)}px "Courier New", monospace`;
+        drawText(`${bestDist} m   ·   ${bestBan} bananas`,
+                 W/2, badgeY + padY + lineH, '#f0c878', '#3a1808');
+    }
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+}
+
+// --- GAME OVER ---
+function drawGameOver(){
+    ctx.fillStyle = `rgba(10,4,24,${Math.min(0.78, player.deadFrame * 0.95)})`;
+    ctx.fillRect(0, 0, W, H);
+
+    if (player.deadFrame < 0.3) return;
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+
+    const isPortrait = H > W;
+
+    // === CRASH! title (top) ===
+    const crashSize = fitTextSize('¡CRASH!', W - 60, Math.min(W * 0.18, 90));
+    ctx.font = `bold ${crashSize}px "Courier New", monospace`;
+    ctx.lineWidth = Math.max(4, crashSize * 0.10);
+    ctx.strokeStyle = '#1a0204';
+    const crashY = H * (isPortrait ? 0.07 : 0.14);
+    ctx.strokeText('¡CRASH!', W/2, crashY);
+    const tg = ctx.createLinearGradient(0, crashY, 0, crashY + crashSize);
+    tg.addColorStop(0, '#ff9050');
+    tg.addColorStop(1, '#9a1010');
+    ctx.fillStyle = tg;
+    ctx.fillText('¡CRASH!', W/2, crashY);
+
+    // === SCORE PANEL — sized so values fit comfortably ===
+    const panelW = Math.min(W * 0.85, 380);
+    const panelH = Math.min(H * (isPortrait ? 0.13 : 0.22), 140);
+    const panelX = W/2 - panelW/2;
+    const panelY = crashY + crashSize * 1.20;
+    drawPixelPanel(panelX, panelY, panelW, panelH);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+
+    const labelSize = Math.max(14, Math.round(panelH * 0.20));
+    const valueSize = Math.max(20, Math.round(panelH * 0.34));
+    ctx.font = `${labelSize}px "Courier New", monospace`;
+    drawText('DISTANCIA', panelX + panelW * 0.28, panelY + panelH * 0.18, '#a07050', '#000');
+    drawText('BANANAS',   panelX + panelW * 0.72, panelY + panelH * 0.18, '#a07050', '#000');
+    ctx.font = `bold ${valueSize}px "Courier New", monospace`;
+    drawText(`${distance} m`, panelX + panelW * 0.28, panelY + panelH * 0.50, C.text, C.textShad);
+    drawText(`${score}`,      panelX + panelW * 0.72, panelY + panelH * 0.50, '#ffe070', '#3a2008');
+
+    // === Best / New Record (OUTSIDE panel, with margin) ===
+    const recSize = Math.max(15, Math.min(W * 0.045, 24));
+    const recY = panelY + panelH + recSize * 0.7;
+    const isNewBestDist = distance > 0 && distance > bestDist;
+    const isNewBestBan  = score > 0 && score > bestBan;
+    const isNewRec = isNewBestDist || isNewBestBan;
+    if (isNewRec && player.deadFrame > 0.7){
+        const flash = 0.65 + 0.35 * Math.sin(frame * 0.25);
+        ctx.font = `bold ${recSize}px "Courier New", monospace`;
+        ctx.globalAlpha = flash;
+        drawText('★ NUEVO RÉCORD ★', W/2, recY, '#ffd070', '#7a3010');
+        ctx.globalAlpha = 1;
+    } else {
+        ctx.font = `${recSize}px "Courier New", monospace`;
+        drawText(`Mejor: ${bestDist} m  ·  ${bestBan} bananas`,
+                 W/2, recY, '#a07050', '#000');
+    }
+
+    // === BUTTONS — anchored to the BOTTOM of the screen ===
+    if (player.deadFrame > 0.5){
+        const btnW = Math.min(W * 0.78, 360);
+        const btnH = Math.min(H * (isPortrait ? 0.08 : 0.13), 72);
+        const btnH2 = btnH * 0.7;
+        const gap = btnH * 0.22;
+        const btn2Y = H - btnH2 - H * 0.06;
+        const btn1Y = btn2Y - gap - btnH;
+        drawButton({
+            x: W/2 - btnW/2, y: btn1Y, w: btnW, h: btnH,
+            label: '↻  JUGAR DE NUEVO',
+            primary: true, pulse: true,
+            onTap: startGame,
+        });
+        drawButton({
+            x: W/2 - btnW/2, y: btn2Y, w: btnW, h: btnH2,
+            label: 'MENÚ',
+            primary: false,
+            onTap: () => { state = STATE.MENU; initMenuWorld(); },
+        });
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+    }
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+let lastT = 0;
+function loop(t){
+    if (!lastT) lastT = t;
+    let dt = (t - lastT) / 1000;
+    lastT = t;
+    if (dt > 0.1) dt = 0.1;
+    update(dt);
+    render();
+    requestAnimationFrame(loop);
+}
+// Start the loop after sprites finish loading (or fail — fallbacks kick in).
+loadSprites(() => {
+    console.log('Sprites loaded:', Object.keys(SPRITES).join(', '));
+    requestAnimationFrame(loop);
+});
+
+// Pre-spawn for menu visuals — re-callable on orientation change
+function initMenuWorld(){
+    segments.length = 0;
+    bananas.length = 0;
+    obstacles.length = 0;
+    worldX = 0;
+    segments.push({ x: -200, w: 9000, type:'TRACK', y: TIER_DEFAULT });
+    nextSpawnX = 8800;
+    for (let i = 0; i < 100; i++){
+        bananas.push({
+            x: 200 + i * 80,
+            y: TIER_DEFAULT - 60 - Math.sin(i * 0.4) * 25,
+            taken: false, anim: i * 0.3,
+        });
+    }
+}
+initMenuWorld();
+// Slow scroll on menu
+setInterval(() => {
+    if (state === STATE.MENU){
+        worldX += 0.6;
+    }
+}, 16);
+
+</script>
+</body>
+</html>

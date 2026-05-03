@@ -1,0 +1,9 @@
+# Python venv used by sprite-processing scripts
+scripts/.venv/
+
+# Byte-compiled
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
