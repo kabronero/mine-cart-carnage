@@ -80,19 +80,6 @@ python3 -m http.server 8765
 
 That's it. There's no build step.
 
-### Regenerating sprites
-
-If you want to regenerate the art:
-
-```bash
-export GOOGLE_AI_API_KEY="your_gemini_key"
-node scripts/gen.js "your prompt" assets/raw.png
-swift scripts/removebg.swift assets/raw.png assets/clean.png
-```
-
-See [`scripts/`](scripts/) for the chroma-key, alpha-harden, hole-fill, and
-wheel-erase helpers.
-
 ## Project structure
 
 ```
