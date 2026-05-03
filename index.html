@@ -258,15 +258,22 @@ function ensureHapticSwitch(){
     label.appendChild(input);
 
     if (HAPTIC_DEBUG_VISIBLE){
-        // Make the switch UNMISTAKABLY visible. Force size + WebKit prefix.
-        // If you DON'T see a green/grey iOS switch toggle, your iOS doesn't
-        // support the `switch` attribute (needs iOS 17.4+).
         input.style.cssText = 'appearance:auto;-webkit-appearance:auto;width:60px;height:36px;margin:0;';
         const text = document.createElement('span');
-        text.textContent = 'haptic test ';
-        text.style.cssText = 'color:#ffd060;font:bold 14px monospace;';
+        text.textContent = 'switch:';
+        text.style.cssText = 'color:#ffd060;font:bold 12px monospace;';
         label.insertBefore(text, input);
-        label.style.cssText = 'position:fixed;bottom:12px;right:12px;padding:8px 12px;background:rgba(0,0,0,0.85);border:2px solid #5a3818;border-radius:8px;z-index:99999;display:flex;align-items:center;gap:8px;';
+        label.style.cssText = 'position:fixed;bottom:12px;right:12px;padding:6px 10px;background:rgba(0,0,0,0.85);border:2px solid #5a3818;border-radius:8px;z-index:99999;display:flex;align-items:center;gap:6px;';
+
+        // Second test button: fires PROGRAMMATIC click on the switch above.
+        // If THIS gives haptic when you tap it → programmatic click works.
+        // If only the switch directly works → iOS requires the touch to land
+        // ON the switch element, .click() from JS won't fire haptic.
+        const btn = document.createElement('button');
+        btn.textContent = 'PROG CLICK';
+        btn.style.cssText = 'position:fixed;bottom:60px;right:12px;padding:8px 14px;background:#d07820;color:#fff;font:bold 13px monospace;border:2px solid #5a2008;border-radius:8px;z-index:99999;';
+        btn.onclick = () => { try { hapticSwitch.click(); } catch(e){} };
+        document.body.appendChild(btn);
     } else {
         // Production: in viewport but invisible to the user (opacity 0, behind canvas)
         label.style.cssText = 'position:fixed;bottom:0;right:0;width:51px;height:31px;opacity:0;z-index:-1;pointer-events:none;';
