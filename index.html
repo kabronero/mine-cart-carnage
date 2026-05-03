@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
@@ -59,8 +59,8 @@
 <div id="orient">
     <div>
         <span class="icon">📱</span>
-        Girá el celular<br>
-        <small style="opacity:0.7">para mejor experiencia</small>
+        Rotate your phone<br>
+        <small style="opacity:0.7">for the best experience</small>
     </div>
 </div>
 <script>
@@ -265,8 +265,54 @@ function sfxJump(){
 
 function sfxCoin(){
     if (!audioCtx || !sfxEnabled) return;
-    playTone(880, 0.07, 'square', 0.18);
-    setTimeout(() => playTone(1320, 0.10, 'square', 0.18), 60);
+    // Pitch climbs with combo level (capped at +24 semitones = 4x)
+    const semis = Math.min(24, combo * 0.6);
+    const factor = Math.pow(2, semis / 12);
+    playTone(880 * factor, 0.07, 'square', 0.18);
+    setTimeout(() => playTone(1320 * factor, 0.10, 'square', 0.18), 60);
+}
+
+function sfxComboBreak(){
+    if (!audioCtx || !sfxEnabled) return;
+    const t = audioCtx.currentTime;
+    // Descending "wah-wah" stinger
+    [0, 0.10, 0.22].forEach((delay, i) => {
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.type = 'sawtooth';
+        const f = 380 - i * 90;
+        o.frequency.setValueAtTime(f, t + delay);
+        o.frequency.exponentialRampToValueAtTime(f * 0.6, t + delay + 0.18);
+        g.gain.setValueAtTime(0.18, t + delay);
+        g.gain.exponentialRampToValueAtTime(0.001, t + delay + 0.20);
+        o.connect(g); g.connect(masterGain);
+        o.start(t + delay); o.stop(t + delay + 0.22);
+    });
+}
+
+// Combo helpers
+function comboTimerForLevel(c){
+    // 2.5s at low combo, shrinks linearly to 1.0s at combo 30+
+    return Math.max(1.0, 2.5 - c * 0.05);
+}
+function bumpCombo(amount){
+    combo += amount;
+    comboTimerMax = comboTimerForLevel(combo);
+    comboTimer = comboTimerMax;
+    if (combo > bestCombo){
+        bestCombo = combo;
+        localStorage.setItem('mcc_best_c', bestCombo);
+    }
+}
+function breakCombo(){
+    if (combo > 1){
+        lastBrokenCombo = combo;
+        comboBreakAnim = 1;
+        sfxComboBreak();
+    }
+    combo = 0;
+    comboTimer = 0;
+    comboTimerMax = 0;
 }
 
 function sfxLand(){
@@ -439,12 +485,20 @@ function startMusic(){
             }
 
             // High pulse — sawtooth racing texture
+            // Pulse — gets louder as combo builds
+            const comboBoostP = Math.min(1, combo * 0.04);
             const p = pulseSections[sec][si];
-            if (p > 0) noteOsc(p, t, stepDur * 0.8, 0.05, 'sawtooth', 0.002, 0.6);
+            if (p > 0) noteOsc(p, t, stepDur * 0.8, 0.05 + comboBoostP * 0.10, 'sawtooth', 0.002, 0.6);
 
-            // Lead motif (square, melodic)
+            // Lead motif (square, melodic) — fires more often with combo (extra
+            // hits on offbeats during section A when combo >= 5)
             const l = leadSections[sec][si];
             if (l > 0) noteOsc(l, t, stepDur * 2.5, 0.13, 'square', 0.005, 0.65);
+            if (combo >= 5 && sec === 0 && si % 4 === 2){
+                // Extra lead pulse — uses pulse pitch to layer in
+                const extraVol = Math.min(0.12, 0.04 + combo * 0.005);
+                noteOsc(p > 0 ? p : 440, t, stepDur * 1.5, extraVol, 'square', 0.003, 0.6);
+            }
 
             // Hi-hat every 16th, accent on downbeats; opens up at end of bridge
             const isFill = isLastBar && si >= 28;
@@ -517,7 +571,8 @@ let particles = [];  // visual only
 let nextSpawnX = 0;
 
 // Score / progression
-let score = 0;            // bananas
+let bananaCount = 0;      // pure count of bananas grabbed
+let score = 0;            // points: bananas × combo multiplier
 let distance = 0;         // metres-ish
 let bestDist = parseInt(localStorage.getItem('mcc_best_d') || '0');
 let bestBan  = parseInt(localStorage.getItem('mcc_best_b') || '0');
@@ -529,6 +584,17 @@ let flyingBananas = [];   // visual: bananas flying to HUD on collect
 let hudPulse = 0;         // 0..1, pulses when a banana arrives at the counter
 let explosions = [];      // {x, y, t, dur} — TNT explosion FX
 let deathReason = null;   // 'fall' | 'hit-barrel' | 'hit-cart' — drives game-over visuals
+
+// Combo system
+let combo = 0;
+let comboTimer = 0;       // seconds remaining before combo breaks
+let comboTimerMax = 0;    // current full-fill duration (shrinks with combo)
+let comboBreakAnim = 0;   // > 0 → fading "broken" graphic
+let lastBrokenCombo = 0;  // shown during the break anim
+let bestCombo = parseInt(localStorage.getItem('mcc_best_c') || '0');
+let floatTexts = [];      // {x, y, text, color, t, dur, vy}
+let nextMilestone = 10;   // next combo milestone to celebrate (10, 20, 30...)
+let bestScore = parseInt(localStorage.getItem('mcc_best_s') || '0');
 
 // ============================================================
 // INPUT
@@ -603,6 +669,7 @@ function startGame(){
     obstacles.length = 0;
     particles.length = 0;
     nextSpawnX = 0;
+    bananaCount = 0;
     score = 0;
     distance = 0;
     shake = 0;
@@ -611,6 +678,13 @@ function startGame(){
     hudPulse = 0;
     explosions.length = 0;
     deathReason = null;
+    combo = 0;
+    comboTimer = 0;
+    comboTimerMax = 0;
+    comboBreakAnim = 0;
+    lastBrokenCombo = 0;
+    floatTexts.length = 0;
+    nextMilestone = 10;
     // Generate initial flat starting track at default tier
     segments.push({ x: -200, w: 1200, type:'TRACK', y: TIER_DEFAULT });
     nextSpawnX = 1000;
@@ -621,6 +695,7 @@ function gameOver(reason){
     if (state !== STATE.PLAYING) return;
     state = STATE.DEAD;
     deathReason = reason || 'fall';
+    breakCombo();
     player.deadFrame = 0;
     shake = 18;
     flashRed = 1;
@@ -641,7 +716,8 @@ function gameOver(reason){
     // Persist best
     distance = Math.floor(worldX / 10);
     if (distance > bestDist){ bestDist = distance; localStorage.setItem('mcc_best_d', bestDist); }
-    if (score > bestBan){ bestBan = score; localStorage.setItem('mcc_best_b', bestBan); }
+    if (bananaCount > bestBan){ bestBan = bananaCount; localStorage.setItem('mcc_best_b', bestBan); }
+    if (score > bestScore){ bestScore = score; localStorage.setItem('mcc_best_s', bestScore); }
     // Crash particles
     for (let i = 0; i < 30; i++){
         particles.push({
@@ -1067,10 +1143,35 @@ function update(dt){
         e.t += dt;
         if (e.t >= e.dur) explosions.splice(i, 1);
     }
+    // Floating "+N" texts
+    for (let i = floatTexts.length - 1; i >= 0; i--){
+        const f = floatTexts[i];
+        f.t += dt;
+        if (f.t >= f.dur) floatTexts.splice(i, 1);
+    }
     // FX decay
     if (shake > 0) shake = Math.max(0, shake - dt * 30);
     if (flashRed > 0) flashRed = Math.max(0, flashRed - dt * 1.6);
     if (hudPulse > 0) hudPulse = Math.max(0, hudPulse - dt * 4);
+    if (comboBreakAnim > 0) comboBreakAnim = Math.max(0, comboBreakAnim - dt * 1.2);
+
+    // Combo timer — only while playing AND there are bananas in reach to chase.
+    // Pauses during dry sections so the player isn't punished for the level.
+    if (state === STATE.PLAYING && combo > 0){
+        let bananasUpcoming = false;
+        const lookAheadMin = worldX;
+        const lookAheadMax = worldX + W * 1.5;
+        for (const b of bananas){
+            if (!b.taken && b.x > lookAheadMin && b.x < lookAheadMax){
+                bananasUpcoming = true;
+                break;
+            }
+        }
+        if (bananasUpcoming){
+            comboTimer -= dt;
+            if (comboTimer <= 0) breakCombo();
+        }
+    }
 }
 
 function updatePlayer(dt){
@@ -1224,8 +1325,48 @@ function checkCollisions(){
         if (aabb(px, py, pw, ph, bx, by, bw, bh)){
             b.taken = true;
             b.anim = 0;
-            const value = isMega ? 5 : 1;
-            score += value;
+            // Score: base × combo multiplier (combo 5 = ×2, 10 = ×3, 20 = ×5)
+            const baseValue = isMega ? 5 : 1;
+            const mult = 1 + Math.floor(combo / 5);
+            const points = baseValue * mult;
+            bananaCount += isMega ? 5 : 1;
+            score += points;
+            bumpCombo(isMega ? 5 : 1);
+
+            // Float "+N" text — color escalates with multiplier so the
+            // player SEES the combo paying off.
+            const ftCol = mult >= 5 ? '#ff5040'
+                       : mult >= 3 ? '#ff9020'
+                       : mult >= 2 ? '#ffd060'
+                                    : '#ffe070';
+            floatTexts.push({
+                x: b.x - worldX,
+                y: b.y - 10,
+                text: `+${points}`,
+                color: ftCol,
+                size: isMega ? 28 : 18 + mult * 2,
+                t: 0, dur: 0.85, vy: -90,
+            });
+
+            // Milestone bonus — chunky reward at every x10
+            while (combo >= nextMilestone){
+                const bonus = nextMilestone * 5;
+                score += bonus;
+                floatTexts.push({
+                    x: W * 0.5,
+                    y: H * 0.32,
+                    text: `★ COMBO ${nextMilestone} +${bonus} ★`,
+                    color: '#ffd060',
+                    size: 32 * HUD_SCALE,
+                    t: 0, dur: 1.4, vy: -40,
+                });
+                if (audioCtx && sfxEnabled){
+                    playTone(660 + nextMilestone * 6, 0.10, 'square', 0.20);
+                    setTimeout(() => playTone(990 + nextMilestone * 6, 0.12, 'square', 0.22), 70);
+                }
+                shake = Math.max(shake, 6);
+                nextMilestone += 10;
+            }
             if (isMega){
                 sfxCoin();
                 setTimeout(() => sfxCoin(), 80);
@@ -1247,16 +1388,22 @@ function checkCollisions(){
                     mega: false,         // flying icons are always small bananas
                 });
             }
-            // Sparkle
-            const nSparks = isMega ? 16 : 6;
+            // Sparkles — count + brightness scale with combo level
+            const baseSparks = isMega ? 16 : 6;
+            const nSparks = baseSparks + Math.min(20, Math.floor(combo / 2));
+            const sparkColor = combo >= 20 ? '#ff6040'
+                             : combo >= 10 ? '#ff9020'
+                             : combo >= 5  ? '#ffd060'
+                             : (isMega ? '#fff080' : C.sparkY);
+            const sparkSize = 1.5 + Math.min(3, combo * 0.05);
             for (let i = 0; i < nSparks; i++){
                 particles.push({
                     x: b.x, y: b.y,
                     vx: (Math.random()-0.5) * (isMega ? 320 : 200),
                     vy: (Math.random()-0.7) * (isMega ? 320 : 200),
                     life: 0.4 + Math.random()*0.4,
-                    color: isMega ? '#fff080' : C.sparkY,
-                    size: 1.5 + Math.random()*2,
+                    color: sparkColor,
+                    size: sparkSize + Math.random()*2,
                     grav: 0,
                 });
             }
@@ -1325,7 +1472,10 @@ function render(){
     drawExplosions();
     ctx.restore();
 
+    drawComboVignette();   // golden glow at edges, scales with combo
     drawHUD();
+    drawCombo();           // combo counter + radial timer ring
+    drawFloatTexts();      // "+N" multiplier popups
     drawFlyingBananas();   // bananas en route to the counter, drawn over HUD
 
     if (flashRed > 0){
@@ -2159,11 +2309,10 @@ function drawParticles(){
 // --- HUD ---
 function drawHUD(){
     const k = HUD_SCALE;
-    ctx.font = `bold ${Math.round(22 * k)}px "Courier New", monospace`;
     ctx.textBaseline = 'top';
     ctx.textAlign = 'left';
 
-    // Banana icon + count — pulses when a flying banana arrives
+    // Banana icon + count
     const iconScale = (1 + hudPulse * 0.45) * k;
     ctx.save();
     ctx.translate(28 * k, 32 * k);
@@ -2171,18 +2320,147 @@ function drawHUD(){
     drawBanana(0, 0, 1, -0.4);
     ctx.restore();
 
+    ctx.font = `bold ${Math.round(22 * k)}px "Courier New", monospace`;
     ctx.save();
     ctx.translate(50 * k, 22 * k);
     const txtScale = (1 + hudPulse * 0.25);
     ctx.scale(txtScale, txtScale);
-    drawText(`x ${score}`, 0, 0, '#ffe070', '#3a2008');
+    drawText(`x ${bananaCount}`, 0, 0, '#ffe070', '#3a2008');
     ctx.restore();
 
-    // Distance right
+    // SCORE — large, top-right (replaces distance) — what combo actually pays for
     ctx.textAlign = 'right';
-    drawText(`${distance} m`, W - 20 * k, 22 * k, C.text, C.textShad);
+    ctx.font = `bold ${Math.round(26 * k)}px "Courier New", monospace`;
+    drawText(`${score}`, W - 20 * k, 18 * k, '#ffe070', '#3a2008');
+    // Small "PTS" / distance below
+    ctx.font = `${Math.round(13 * k)}px "Courier New", monospace`;
+    drawText(`PTS  ·  ${distance}m`, W - 20 * k, 50 * k, '#a07050', '#000');
 
     ctx.textAlign = 'left';
+}
+
+// Floating "+N" text that pops up off collected bananas / milestones
+function drawFloatTexts(){
+    for (const f of floatTexts){
+        const a = Math.max(0, 1 - (f.t / f.dur));
+        const ease = 1 - Math.pow(1 - (f.t / f.dur), 2);
+        const y = f.y + (f.vy || -60) * ease;
+        const popScale = f.t < 0.10 ? 1 + (0.10 - f.t) * 4 : 1;  // brief pop
+        ctx.save();
+        ctx.globalAlpha = a;
+        ctx.font = `bold ${Math.round((f.size || 18) * popScale)}px "Courier New", monospace`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillText(f.text, f.x + 2, y + 2);
+        ctx.fillStyle = f.color || '#ffe070';
+        ctx.fillText(f.text, f.x, y);
+        ctx.restore();
+    }
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+}
+
+// === COMBO VIGNETTE — golden edge glow that grows with combo ===
+function drawComboVignette(){
+    if (combo < 3 && comboBreakAnim <= 0) return;
+    const intensity = Math.min(1, combo / 25);
+    if (intensity > 0){
+        const g = ctx.createRadialGradient(W/2, H/2, Math.min(W, H) * 0.35, W/2, H/2, Math.max(W, H) * 0.7);
+        g.addColorStop(0, 'rgba(255, 200, 60, 0)');
+        const edgeAlpha = 0.10 + intensity * 0.30;
+        const col = combo >= 20 ? `rgba(255, 80, 40, ${edgeAlpha})`
+                  : combo >= 10 ? `rgba(255, 140, 40, ${edgeAlpha})`
+                                 : `rgba(255, 200, 60, ${edgeAlpha})`;
+        g.addColorStop(1, col);
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, W, H);
+    }
+    // Break flash — gray pulse
+    if (comboBreakAnim > 0){
+        ctx.fillStyle = `rgba(100, 100, 100, ${comboBreakAnim * 0.25})`;
+        ctx.fillRect(0, 0, W, H);
+    }
+}
+
+// === COMBO HUD — counter + radial timer ===
+function drawCombo(){
+    const k = HUD_SCALE;
+    // Show "broken" anim falling/fading
+    if (comboBreakAnim > 0 && lastBrokenCombo >= 2){
+        const a = comboBreakAnim;
+        const dropY = (1 - a) * 60;
+        ctx.save();
+        ctx.globalAlpha = a;
+        ctx.font = `bold ${Math.round(48 * k)}px "Courier New", monospace`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillText(`x${lastBrokenCombo}`, W/2 + 2, 70 * k + dropY + 2);
+        ctx.fillStyle = '#888';
+        ctx.fillText(`x${lastBrokenCombo}`, W/2, 70 * k + dropY);
+        ctx.font = `bold ${Math.round(16 * k)}px "Courier New", monospace`;
+        ctx.fillStyle = '#aaa';
+        ctx.fillText('COMBO LOST', W/2, 110 * k + dropY);
+        ctx.restore();
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+    }
+    if (combo < 2) return;
+
+    // Color escalation
+    let col, glowCol;
+    if      (combo >= 20){ col = '#ff5040'; glowCol = 'rgba(255, 80, 40, 0.6)'; }
+    else if (combo >= 10){ col = '#ff9020'; glowCol = 'rgba(255, 140, 40, 0.5)'; }
+    else if (combo >= 5){  col = '#ffd060'; glowCol = 'rgba(255, 200, 60, 0.45)'; }
+    else                 { col = '#ffffff'; glowCol = 'rgba(255, 255, 255, 0.3)'; }
+
+    // Pulse on each banana grab — comboTimer just refilled, pulse from full
+    const fill = comboTimerMax > 0 ? Math.max(0, comboTimer / comboTimerMax) : 0;
+    const pulse = 1 + (1 - fill) * 0.0;  // counter grows briefly on add
+    const justGotIt = (comboTimerMax - comboTimer) < 0.10;
+    const popScale = justGotIt ? 1.25 : 1.0;
+
+    const cx = W / 2;
+    const cy = (28 + 28) * k;   // top-center
+    const radius = 30 * k;
+
+    // Background ring
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx.lineWidth = 5 * k;
+    ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+    ctx.stroke();
+
+    // Timer ring — drains as combo timer counts down
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * fill);
+    ctx.lineWidth = 5 * k;
+    // Color of ring shifts to red as timer empties
+    const timerCol = fill > 0.5 ? col
+                   : fill > 0.25 ? '#ffa030'
+                                  : '#ff4030';
+    ctx.strokeStyle = timerCol;
+    ctx.stroke();
+
+    // Glow behind number
+    ctx.fillStyle = glowCol;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius * 0.85 * popScale, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Counter number
+    const fontSize = Math.round((combo >= 100 ? 22 : 28) * k * popScale);
+    ctx.font = `bold ${fontSize}px "Courier New", monospace`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillText(`x${combo}`, cx + 1, cy + 2);
+    ctx.fillStyle = col;
+    ctx.fillText(`x${combo}`, cx, cy);
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
 }
 
 function drawText(s, x, y, color, shadow){
@@ -2410,7 +2688,7 @@ function drawMenu(){
     const btnY = isLandscape ? H * 0.66 : H * 0.62;
     drawButton({
         x: W/2 - btnW/2, y: btnY, w: btnW, h: btnH,
-        label: '▶  JUGAR',
+        label: '▶  PLAY',
         primary: true, pulse: true,
         onTap: startGame,
     });
@@ -2418,10 +2696,10 @@ function drawMenu(){
     // Hint text under button
     const hintSize = Math.max(11, Math.round(btnH * 0.22));
     ctx.font = `${hintSize}px "Courier New", monospace`;
-    drawText('Tocá la pantalla para saltar', W/2, btnY + btnH + 12, '#a07050', '#000');
+    drawText('Tap the screen to jump', W/2, btnY + btnH + 12, '#a07050', '#000');
 
     // === BEST SCORE PANEL (16-bit framed) ===
-    if (bestDist > 0 || bestBan > 0){
+    if (bestScore > 0 || bestDist > 0){
         const recSize = Math.max(14, Math.round(btnH * 0.28));
         const lineH = recSize * 1.15;
         const padY = recSize * 0.55;
@@ -2430,13 +2708,12 @@ function drawMenu(){
         const badgeY = H - badgeH - H * 0.06;
         const badgeX = W/2 - badgeW/2;
         drawPixelPanel(badgeX, badgeY, badgeW, badgeH);
-        // drawButton above reset textAlign to 'left' — re-center for the badge
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
         ctx.font = `bold ${recSize}px "Courier New", monospace`;
-        drawText('★ MEJOR RÉCORD ★', W/2, badgeY + padY, '#ffd070', '#3a1808');
+        drawText('★ HIGH SCORE ★', W/2, badgeY + padY, '#ffd070', '#3a1808');
         ctx.font = `${Math.round(recSize * 0.88)}px "Courier New", monospace`;
-        drawText(`${bestDist} m   ·   ${bestBan} bananas`,
+        drawText(`${bestScore} pts  ·  ${bestDist}m`,
                  W/2, badgeY + padY + lineH, '#f0c878', '#3a1808');
     }
 
@@ -2457,17 +2734,17 @@ function drawGameOver(){
     const isPortrait = H > W;
 
     // === CRASH! title (top) ===
-    const crashSize = fitTextSize('¡CRASH!', W - 60, Math.min(W * 0.18, 90));
+    const crashSize = fitTextSize('CRASH!', W - 60, Math.min(W * 0.18, 90));
     ctx.font = `bold ${crashSize}px "Courier New", monospace`;
     ctx.lineWidth = Math.max(4, crashSize * 0.10);
     ctx.strokeStyle = '#1a0204';
     const crashY = H * (isPortrait ? 0.07 : 0.14);
-    ctx.strokeText('¡CRASH!', W/2, crashY);
+    ctx.strokeText('CRASH!', W/2, crashY);
     const tg = ctx.createLinearGradient(0, crashY, 0, crashY + crashSize);
     tg.addColorStop(0, '#ff9050');
     tg.addColorStop(1, '#9a1010');
     ctx.fillStyle = tg;
-    ctx.fillText('¡CRASH!', W/2, crashY);
+    ctx.fillText('CRASH!', W/2, crashY);
 
     // === SCORE PANEL — sized so values fit comfortably ===
     const panelW = Math.min(W * 0.85, 380);
@@ -2478,30 +2755,38 @@ function drawGameOver(){
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
 
-    const labelSize = Math.max(14, Math.round(panelH * 0.20));
-    const valueSize = Math.max(20, Math.round(panelH * 0.34));
+    // SCORE big in middle, secondary stats on sides
+    const labelSize = Math.max(13, Math.round(panelH * 0.16));
+    const bigSize = Math.max(28, Math.round(panelH * 0.45));
+    const sideSize = Math.max(16, Math.round(panelH * 0.24));
+    // Center: SCORE
     ctx.font = `${labelSize}px "Courier New", monospace`;
-    drawText('DISTANCIA', panelX + panelW * 0.28, panelY + panelH * 0.18, '#a07050', '#000');
-    drawText('BANANAS',   panelX + panelW * 0.72, panelY + panelH * 0.18, '#a07050', '#000');
-    ctx.font = `bold ${valueSize}px "Courier New", monospace`;
-    drawText(`${distance} m`, panelX + panelW * 0.28, panelY + panelH * 0.50, C.text, C.textShad);
-    drawText(`${score}`,      panelX + panelW * 0.72, panelY + panelH * 0.50, '#ffe070', '#3a2008');
+    drawText('SCORE', W/2, panelY + panelH * 0.10, '#a07050', '#000');
+    ctx.font = `bold ${bigSize}px "Courier New", monospace`;
+    drawText(`${score}`, W/2, panelY + panelH * 0.32, '#ffe070', '#3a2008');
+    // Sides: distance + bananas
+    ctx.font = `${labelSize * 0.85}px "Courier New", monospace`;
+    drawText('DISTANCE', panelX + panelW * 0.20, panelY + panelH * 0.72, '#a07050', '#000');
+    drawText('BANANAS',   panelX + panelW * 0.80, panelY + panelH * 0.72, '#a07050', '#000');
+    ctx.font = `bold ${sideSize}px "Courier New", monospace`;
+    drawText(`${distance}m`,    panelX + panelW * 0.20, panelY + panelH * 0.86, C.text, C.textShad);
+    drawText(`${bananaCount}`,  panelX + panelW * 0.80, panelY + panelH * 0.86, C.text, C.textShad);
 
     // === Best / New Record (OUTSIDE panel, with margin) ===
     const recSize = Math.max(15, Math.min(W * 0.045, 24));
     const recY = panelY + panelH + recSize * 0.7;
-    const isNewBestDist = distance > 0 && distance > bestDist;
-    const isNewBestBan  = score > 0 && score > bestBan;
-    const isNewRec = isNewBestDist || isNewBestBan;
+    const isNewBestScore = score > 0 && score > bestScore;
+    const isNewBestDist  = distance > 0 && distance > bestDist;
+    const isNewRec = isNewBestScore || isNewBestDist;
     if (isNewRec && player.deadFrame > 0.7){
         const flash = 0.65 + 0.35 * Math.sin(frame * 0.25);
         ctx.font = `bold ${recSize}px "Courier New", monospace`;
         ctx.globalAlpha = flash;
-        drawText('★ NUEVO RÉCORD ★', W/2, recY, '#ffd070', '#7a3010');
+        drawText('★ NEW HIGH SCORE ★', W/2, recY, '#ffd070', '#7a3010');
         ctx.globalAlpha = 1;
     } else {
         ctx.font = `${recSize}px "Courier New", monospace`;
-        drawText(`Mejor: ${bestDist} m  ·  ${bestBan} bananas`,
+        drawText(`Best: ${bestScore} pts · ${bestDist}m`,
                  W/2, recY, '#a07050', '#000');
     }
 
@@ -2515,13 +2800,13 @@ function drawGameOver(){
         const btn1Y = btn2Y - gap - btnH;
         drawButton({
             x: W/2 - btnW/2, y: btn1Y, w: btnW, h: btnH,
-            label: '↻  JUGAR DE NUEVO',
+            label: '↻  PLAY AGAIN',
             primary: true, pulse: true,
             onTap: startGame,
         });
         drawButton({
             x: W/2 - btnW/2, y: btn2Y, w: btnW, h: btnH2,
-            label: 'MENÚ',
+            label: 'MENU',
             primary: false,
             onTap: () => { state = STATE.MENU; initMenuWorld(); },
         });
