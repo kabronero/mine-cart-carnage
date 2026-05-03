@@ -239,9 +239,13 @@ let hapticSwitch = null;
 //   - Input keeps `all:initial; appearance:auto` so iOS applies switch style
 //   - Element stays in the render tree (off-screen, NOT display:none)
 //   - No pointer-events:none — that can break programmatic dispatch
-// DEBUG: set to true to show the switch visibly in the bottom-right corner
-// so you can tap it MANUALLY and confirm whether iOS fires haptic at all.
-const HAPTIC_DEBUG_VISIBLE = true;
+// DEBUG: set to true to show the switch visibly in the bottom-right corner.
+const HAPTIC_DEBUG_VISIBLE = false;
+// On iOS, haptic ONLY fires inside a user-gesture handler. Game-loop events
+// (banana grab, landing, crash) aren't user gestures, so they queue here and
+// drain on the next tap.
+let pendingHaptic = null;
+function rankHaptic(s){ return s === 'heavy' ? 3 : s === 'medium' ? 2 : 1; }
 
 function ensureHapticSwitch(){
     if (hapticSwitch || typeof document === 'undefined' || !document.body) return;
@@ -285,21 +289,34 @@ function ensureHapticSwitch(){
     hapticSwitch = label;
 }
 
-function haptic(strength){
-    if (!hapticsEnabled) return;
-    // Android / spec-compliant browsers
-    if (navigator.vibrate){
-        const ms = strength === 'heavy' ? 40 : strength === 'medium' ? 18 : 7;
-        try { navigator.vibrate(ms); } catch(e){}
-        return;
-    }
-    // iOS — click the label to toggle the switch and fire Taptic Engine.
-    // For heavier feedback, fire multiple toggles in rapid succession.
+function fireHapticImmediate(strength){
     ensureHapticSwitch();
     if (!hapticSwitch) return;
     const taps = strength === 'heavy' ? 3 : strength === 'medium' ? 2 : 1;
     for (let i = 0; i < taps; i++){
         setTimeout(() => { try { hapticSwitch.click(); } catch(e){} }, i * 30);
+    }
+}
+
+function haptic(strength){
+    if (!hapticsEnabled) return;
+    // Android etc: native vibrate (no user-gesture restriction)
+    if (navigator.vibrate){
+        const ms = strength === 'heavy' ? 40 : strength === 'medium' ? 18 : 7;
+        try { navigator.vibrate(ms); } catch(e){}
+        return;
+    }
+    // iOS: queue, will drain on the next user tap (where we have gesture context)
+    if (!pendingHaptic || rankHaptic(strength) > rankHaptic(pendingHaptic)){
+        pendingHaptic = strength;
+    }
+}
+
+// Drain queued haptics on a user gesture. Call from inside touchstart/click.
+function drainHapticsOnGesture(){
+    if (pendingHaptic){
+        fireHapticImmediate(pendingHaptic);
+        pendingHaptic = null;
     }
 }
 
@@ -689,6 +706,10 @@ let pendingAction = false;
 function pressJump(canvasX, canvasY){
     initAudio();
     if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    // We're inside a user-gesture handler — drain any queued haptics now.
+    // On iOS this is the ONLY moment haptic fires, so we coalesce game-loop
+    // events (banana grabs, landings, crashes) onto the player's next tap.
+    drainHapticsOnGesture();
     // On menu / game-over, check button hits first
     if ((state === STATE.MENU || state === STATE.DEAD) && canvasX != null){
         if (tryHitButton(canvasX, canvasY)) return;
@@ -701,9 +722,11 @@ function pressJump(canvasX, canvasY){
         if (player.deadFrame > 0.6) startGame();
         return;
     }
-    // Buffered jump
+    // Buffered jump + tactile feedback for the jump itself
     player.bufferedJump = JUMP_BUFFER;
     player.jumpHeld = true;
+    if (!navigator.vibrate) fireHapticImmediate('light');   // direct (in user gesture)
+    else haptic('light');                                   // android via vibrate
 }
 function releaseJump(){ player.jumpHeld = false; }
 
