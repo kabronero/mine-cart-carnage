@@ -222,37 +222,44 @@ let musicEnabled = true;
 let sfxEnabled = true;
 
 // ============================================================
-// HAPTICS — short tactile bumps on key gameplay moments
-// Android etc.: native Vibration API. iOS Safari: ultra-short audio
-// impulse routed through AudioContext, which actuates the speaker
-// briefly enough to wake the Taptic Engine (Lochie-style trick).
+// HAPTICS — Lochie / WebHaptics technique
+// Android etc.: navigator.vibrate (native).
+// iOS Safari: programmatically .click() a hidden <input type="checkbox" switch>
+// element. iOS fires native Taptic Engine haptic on every toggle of its
+// "switch"-styled checkbox. No audio, no permissions.
 // ============================================================
 let hapticsEnabled = true;
+let hapticSwitch = null;
+
+function ensureHapticSwitch(){
+    if (hapticSwitch || typeof document === 'undefined') return;
+    const el = document.createElement('input');
+    el.type = 'checkbox';
+    el.setAttribute('switch', '');           // iOS-native switch appearance
+    el.setAttribute('aria-hidden', 'true');
+    el.tabIndex = -1;
+    // Hide off-screen but keep functional
+    el.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;all:initial;appearance:auto;pointer-events:none;';
+    document.body.appendChild(el);
+    hapticSwitch = el;
+}
+
 function haptic(strength){
     if (!hapticsEnabled) return;
-    // Android / spec-compliant browsers
+    // Android / spec-compliant browsers — strength via duration
     if (navigator.vibrate){
         const ms = strength === 'heavy' ? 40 : strength === 'medium' ? 18 : 7;
         try { navigator.vibrate(ms); } catch(e){}
         return;
     }
-    // iOS Safari fallback (audioCtx must already be unlocked by a tap)
-    if (!audioCtx) return;
-    const t = audioCtx.currentTime;
-    const dur = strength === 'heavy' ? 0.045 : strength === 'medium' ? 0.022 : 0.010;
-    const samples = Math.ceil(audioCtx.sampleRate * dur);
-    const buf = audioCtx.createBuffer(1, samples, audioCtx.sampleRate);
-    const d = buf.getChannelData(0);
-    const freq = strength === 'heavy' ? 45 : strength === 'medium' ? 70 : 100;
-    for (let i = 0; i < samples; i++){
-        d[i] = Math.sin(2 * Math.PI * freq * (i / audioCtx.sampleRate));
+    // iOS fallback — toggle the hidden iOS switch (fires native haptic).
+    // For stronger feedback, fire multiple toggles in quick succession.
+    ensureHapticSwitch();
+    if (!hapticSwitch) return;
+    const taps = strength === 'heavy' ? 3 : strength === 'medium' ? 2 : 1;
+    for (let i = 0; i < taps; i++){
+        setTimeout(() => { try { hapticSwitch.click(); } catch(e){} }, i * 35);
     }
-    const src = audioCtx.createBufferSource();
-    src.buffer = buf;
-    const g = audioCtx.createGain();
-    g.gain.value = 0.0001;   // effectively inaudible
-    src.connect(g); g.connect(audioCtx.destination);
-    src.start(t);
 }
 
 function initAudio(){
