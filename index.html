@@ -2309,32 +2309,53 @@ function drawParticles(){
 // --- HUD ---
 function drawHUD(){
     const k = HUD_SCALE;
+    const padX = 16 * k;
+    const padY = 18 * k;
+    const rowH = 30 * k;
+    const labelCol = 60 * k;     // x where values start (after the label)
+
+    // Subtle dark fade-out backdrop on the left so values pop on any BG
+    const bgW = 200 * k;
+    const bgH = (rowH * 3 + 18 * k);
+    const grad = ctx.createLinearGradient(0, 0, bgW, 0);
+    grad.addColorStop(0, 'rgba(0,0,0,0.55)');
+    grad.addColorStop(0.7, 'rgba(0,0,0,0.20)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, bgW, bgH);
+
     ctx.textBaseline = 'top';
     ctx.textAlign = 'left';
 
-    // Banana icon + count
+    // ROW 1 — Bananas (icon + count, brightest, with pulse on grab)
     const iconScale = (1 + hudPulse * 0.45) * k;
     ctx.save();
-    ctx.translate(28 * k, 32 * k);
+    ctx.translate(padX + 8 * k, padY + 12 * k);
     ctx.scale(iconScale, iconScale);
     drawBanana(0, 0, 1, -0.4);
     ctx.restore();
 
-    ctx.font = `bold ${Math.round(22 * k)}px "Courier New", monospace`;
-    ctx.save();
-    ctx.translate(50 * k, 22 * k);
     const txtScale = (1 + hudPulse * 0.25);
+    ctx.save();
+    ctx.translate(padX + 32 * k, padY);
     ctx.scale(txtScale, txtScale);
+    ctx.font = `bold ${Math.round(24 * k)}px "Courier New", monospace`;
     drawText(`x ${bananaCount}`, 0, 0, '#ffe070', '#3a2008');
     ctx.restore();
 
-    // SCORE — large, top-right (replaces distance) — what combo actually pays for
-    ctx.textAlign = 'right';
-    ctx.font = `bold ${Math.round(26 * k)}px "Courier New", monospace`;
-    drawText(`${score}`, W - 20 * k, 18 * k, '#ffe070', '#3a2008');
-    // Small "PTS" / distance below
-    ctx.font = `${Math.round(13 * k)}px "Courier New", monospace`;
-    drawText(`PTS  ·  ${distance}m`, W - 20 * k, 50 * k, '#a07050', '#000');
+    // ROW 2 — SCORE (label + big value, primary)
+    const row2Y = padY + rowH;
+    ctx.font = `bold ${Math.round(11 * k)}px "Courier New", monospace`;
+    drawText('PTS', padX, row2Y + 7 * k, '#a07050', '#000');
+    ctx.font = `bold ${Math.round(22 * k)}px "Courier New", monospace`;
+    drawText(`${score}`, padX + labelCol, row2Y, C.text, C.textShad);
+
+    // ROW 3 — Distance (label + medium value)
+    const row3Y = padY + rowH * 2;
+    ctx.font = `bold ${Math.round(11 * k)}px "Courier New", monospace`;
+    drawText('DIST', padX, row3Y + 5 * k, '#a07050', '#000');
+    ctx.font = `bold ${Math.round(18 * k)}px "Courier New", monospace`;
+    drawText(`${distance}m`, padX + labelCol, row3Y, '#d4a070', '#2a1408');
 
     ctx.textAlign = 'left';
 }
